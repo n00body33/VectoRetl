@@ -33,7 +33,11 @@ impl CefSerializerConfig {
             String::from("Datadog")
         };
         if device_vendor.len() > 63 {
-            return Err(format!("device_vendor exceed 63 characters limit: actual {}", device_vendor.len()).into());
+            return Err(format!(
+                "device_vendor exceed 63 characters limit: actual {}",
+                device_vendor.len()
+            )
+            .into());
         };
 
         let device_product = if let Some(device_product) = self.cef.device_product.clone() {
@@ -42,16 +46,24 @@ impl CefSerializerConfig {
             String::from("Vector")
         };
         if device_product.len() > 63 {
-            return Err(format!("device_product exceed 63 characters limit: actual {}", device_product.len()).into());
+            return Err(format!(
+                "device_product exceed 63 characters limit: actual {}",
+                device_product.len()
+            )
+            .into());
         };
 
         let device_version = if let Some(device_version) = self.cef.device_version.clone() {
             device_version
         } else {
-            String::from("0") // Major version. TODO(nabokikhms): find a way to get the actual vector version.
+            String::from("0") // Major version. TODO(nabokihms): find a way to get the actual vector version.
         };
         if device_version.len() > 31 {
-            return Err(format!("device_version exceed 31 characters limit: actual {}", device_version.len()).into());
+            return Err(format!(
+                "device_version exceed 31 characters limit: actual {}",
+                device_version.len()
+            )
+            .into());
         };
 
         let device_event_class_id =
@@ -61,7 +73,11 @@ impl CefSerializerConfig {
                 String::from("Telemetry Event")
             };
         if device_event_class_id.len() > 1023 {
-            return Err(format!("device_event_class_id exceed 1023 characters limit: actual {}", device_event_class_id.len()).into());
+            return Err(format!(
+                "device_event_class_id exceed 1023 characters limit: actual {}",
+                device_event_class_id.len()
+            )
+            .into());
         };
 
         for (key, _) in &self.cef.extensions {
@@ -125,12 +141,12 @@ pub struct CefSerializerOptions {
     pub version: Version,
 
     /// Identifies the vendor of the product.
-    /// The part of a unique device identifier. No two products can use the same pair of devide vendoer and device product combination.
+    /// The part of a unique device identifier. No two products can use the same pair of devide vendor and device product combination.
     /// The value length must be lower or equal to 63.
     pub device_vendor: Option<String>,
 
     /// Identifies the product of a vendor.
-    /// The part of a unique device identifier. No two products can use the same pair of devide vendoer and device product combination.
+    /// The part of a unique device identifier. No two products can use the same pair of devide vendor and device product combination.
     /// The value length must be lower or equal to 63.
     pub device_product: Option<String>,
 
@@ -144,24 +160,25 @@ pub struct CefSerializerOptions {
 
     /// This is a path that points to filed of a log event that reflects importance of the event.
     /// Reflects importance of the event.
-    /// 
+    ///
     /// It must point to a number from 0 to 10.
     /// 0 = Lowest, 10 = Highest.
     /// Equals to "cef.severity" by default.
     pub severity: ConfigTargetPath,
 
-    /// This is a path that points to the humman-readable description of a log event.
+    /// This is a path that points to the human-readable description of a log event.
     /// The value length must be lower or equal to 512.
     /// Equals to "cef.name" by default.
     pub name: ConfigTargetPath,
 
     /// The collection fo key-value pairs. Keys are the keys of the extensions, and values are path that point to the extension values of a log event.
     /// The event can have any number of key-value pairs in any order.
-    #[configurable(metadata(docs::additional_props_description = "This is a path that points to the extension value of a log event."))]
+    #[configurable(metadata(
+        docs::additional_props_description = "This is a path that points to the extension value of a log event."
+    ))]
     pub extensions: HashMap<String, ConfigTargetPath>,
-
     // TODO(nabokihms): use Template instead of ConfigTargetPath.
-    // Templstes are in the src/ package, and codes are in the lib/codecs.
+    // Templates are in the src/ package, and codes are in the lib/codecs.
 }
 
 impl Default for CefSerializerOptions {
@@ -230,7 +247,11 @@ impl Encoder<Event> for CefSerializer {
             }
             Ok(severity) => {
                 if severity > 10 {
-                    return Err(format!("severity must be a number from 0 to 10: actual {}", severity).into());
+                    return Err(format!(
+                        "severity must be a number from 0 to 10: actual {}",
+                        severity
+                    )
+                    .into());
                 };
                 severity
             }

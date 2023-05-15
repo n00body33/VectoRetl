@@ -198,8 +198,8 @@ pub enum SerializerConfig {
     },
 
     /// Encodes an event as a CEF (Common Event Format) formatted message.
-    /// 
-    Cef (
+    ///
+    Cef(
         /// Options for the CEF encoder.
         CefSerializerConfig,
     ),

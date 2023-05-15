@@ -205,7 +205,7 @@ base: components: sinks: gcp_cloud_storage: configuration: {
 					device_product: {
 						description: """
 																Identifies the product of a vendor.
-																The part of a unique device identifier. No two products can use the same pair of devide vendoer and device product combination.
+																The part of a unique device identifier. No two products can use the same pair of devide vendor and device product combination.
 																The value length must be lower or equal to 63.
 																"""
 						required: false
@@ -214,7 +214,7 @@ base: components: sinks: gcp_cloud_storage: configuration: {
 					device_vendor: {
 						description: """
 																Identifies the vendor of the product.
-																The part of a unique device identifier. No two products can use the same pair of devide vendoer and device product combination.
+																The part of a unique device identifier. No two products can use the same pair of devide vendor and device product combination.
 																The value length must be lower or equal to 63.
 																"""
 						required: false
@@ -242,7 +242,7 @@ base: components: sinks: gcp_cloud_storage: configuration: {
 					}
 					name: {
 						description: """
-																This is a path that points to the humman-readable description of a log event.
+																This is a path that points to the human-readable description of a log event.
 																The value length must be lower or equal to 512.
 																Equals to "cef.name" by default.
 																"""

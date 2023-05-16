@@ -11,6 +11,32 @@ use vector_core::{
     schema,
 };
 
+/// Device event identity.
+#[derive(Debug, Clone)]
+pub struct DeviceSettings {
+    pub vendor: String,
+    pub product: String,
+    pub version: String,
+    pub event_class_id: String,
+}
+
+impl DeviceSettings {
+    /// Creates a new `DeviceSettings`.
+    pub const fn new(
+        vendor: String,
+        product: String,
+        version: String,
+        event_class_id: String,
+    ) -> Self {
+        Self {
+            vendor,
+            product,
+            version,
+            event_class_id,
+        }
+    }
+}
+
 /// Config used to build a `CefSerializer`.
 #[crate::configurable_component]
 #[derive(Debug, Clone)]
@@ -80,19 +106,23 @@ impl CefSerializerConfig {
             .into());
         };
 
-        for (key, _) in &self.cef.extensions {
+        for key in self.cef.extensions.keys() {
             if !key.chars().all(|c| c.is_ascii_alphabetic()) {
                 // TODO (nabokihms): Output all invalid keys
                 return Err(format!("extension keys can only contain ascii alphabetical characters: invalid key '{}'", key).into());
             }
         }
 
-        Ok(CefSerializer::new(
-            self.cef.version.clone(),
+        let device = DeviceSettings::new(
             device_vendor,
             device_product,
             device_version,
             device_event_class_id,
+        );
+
+        Ok(CefSerializer::new(
+            self.cef.version.clone(),
+            device,
             self.cef.severity.clone(),
             self.cef.name.clone(),
             self.cef.extensions.clone(),
@@ -201,10 +231,7 @@ impl Default for CefSerializerOptions {
 #[derive(Debug, Clone)]
 pub struct CefSerializer {
     version: Version,
-    device_vendor: String,
-    device_product: String,
-    device_version: String,
-    device_event_class_id: String,
+    device: DeviceSettings,
     severity: ConfigTargetPath,
     name: ConfigTargetPath,
     extensions: HashMap<String, ConfigTargetPath>,
@@ -214,20 +241,14 @@ impl CefSerializer {
     /// Creates a new `CefSerializer`.
     pub const fn new(
         version: Version,
-        device_vendor: String,
-        device_product: String,
-        device_version: String,
-        device_event_class_id: String,
+        device: DeviceSettings,
         severity: ConfigTargetPath,
         name: ConfigTargetPath,
         extensions: HashMap<String, ConfigTargetPath>,
     ) -> Self {
         Self {
             version,
-            device_product,
-            device_vendor,
-            device_version,
-            device_event_class_id,
+            device,
             severity,
             name,
             extensions,
@@ -265,7 +286,7 @@ impl Encoder<Event> for CefSerializer {
         let mut formatted_extensions = Vec::new();
         for (extension, field) in &self.extensions {
             let value = get_log_event_value(&log, field);
-            if value == "" {
+            if value.is_empty() {
                 continue;
             }
             let value = escape_extension(value);
@@ -275,14 +296,14 @@ impl Encoder<Event> for CefSerializer {
         buffer.write_fmt(format_args!(
             "CEF:{}|{}|{}|{}|{}|{}|{}",
             &self.version.as_str(),
-            &self.device_vendor,
-            &self.device_product,
-            &self.device_version,
-            &self.device_event_class_id,
+            &self.device.vendor,
+            &self.device.product,
+            &self.device.version,
+            &self.device.event_class_id,
             severity,
             name,
         ))?;
-        if formatted_extensions.len() > 0 {
+        if !formatted_extensions.is_empty() {
             formatted_extensions.sort();
 
             buffer.write_char('|')?;
@@ -309,14 +330,14 @@ fn get_log_event_value(log: &LogEvent, field: &ConfigTargetPath) -> String {
 }
 
 fn escape_header(mut s: String) -> String {
-    s = s.replace(r#"\"#, r#"\\"#);
-    s = s.replace(r#"|"#, r#"\|"#);
+    s = s.replace('\\', r#"\\"#);
+    s = s.replace('|', r#"\|"#);
     String::from_utf8_lossy(s.as_bytes()).to_string()
 }
 
 fn escape_extension(mut s: String) -> String {
-    s = s.replace(r#"\"#, r#"\\"#);
-    s = s.replace(r#"="#, r#"\="#);
+    s = s.replace('\\', r#"\\"#);
+    s = s.replace('=', r#"\="#);
     String::from_utf8_lossy(s.as_bytes()).to_string()
 }
 

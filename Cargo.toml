@@ -153,7 +153,7 @@ futures = { version = "0.3.28", default-features = false, features = ["compat", 
 tokio = { version = "1.32.0", default-features = false, features = ["full"] }
 tokio-openssl = { version = "0.6.3", default-features = false }
 tokio-stream = { version = "0.1.14", default-features = false, features = ["net", "sync", "time"] }
-tokio-util = { version = "0.7", default-features = false, features = ["io", "time"] }
+tokio-util = { version = "0.7.8", default-features = false, features = ["io", "time"] }
 console-subscriber = { version = "0.1.10", default-features = false, optional = true }
 
 # Tracing
@@ -657,6 +657,7 @@ sinks-logs = [
   "sinks-vector",
   "sinks-webhdfs",
   "sinks-websocket",
+  "sinks-sftp",
 ]
 sinks-metrics = [
   "sinks-appsignal",
@@ -722,6 +723,7 @@ sinks-utils-udp = []
 sinks-vector = ["sinks-utils-udp", "dep:tonic", "protobuf-build"]
 sinks-websocket = ["dep:tokio-tungstenite"]
 sinks-webhdfs = ["dep:opendal"]
+sinks-sftp = ["dep:opendal", "opendal?/services-sftp"]
 
 # Datadog integration
 enterprise = [

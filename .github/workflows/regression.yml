@@ -285,7 +285,7 @@ jobs:
 
   build-baseline:
     name: Build baseline Vector container
-    runs-on: [linux, ubuntu-20.04-4core]
+    runs-on: ubuntu-20.04
     needs:
       - compute-metadata
     steps:
@@ -322,7 +322,7 @@ jobs:
 
   build-comparison:
     name: Build comparison Vector container
-    runs-on: [linux, ubuntu-20.04-4core]
+    runs-on: ubuntu-20.04
     needs:
       - compute-metadata
     steps:

@@ -48,7 +48,7 @@ jobs:
 
   integration-tests:
     name: Integration Tests
-    runs-on: [linux, ubuntu-20.04-4core]
+    runs-on: ubuntu-20.04
     needs: changes
     if: always() && (
       github.event_name == 'merge_group' || (
@@ -96,8 +96,6 @@ jobs:
           submodules: "recursive"
 
       - run: sudo npm -g install @datadog/datadog-ci
-
-      - run: docker image prune -af ; docker container prune -f
 
       - name: Determine if secrets are defined (PR author is team member).
         if: github.event_name == 'pull_request'
@@ -213,8 +211,6 @@ jobs:
           max_attempts: 3
           command: bash scripts/ci-integration-test.sh  dnstap
 
-      - run: docker image prune -af --filter=label!=vector-test-runner=true ; docker container prune -f
-
       - if: ${{ github.event_name == 'merge_group' || needs.changes.outputs.all-int == 'true' || needs.changes.outputs.docker-logs == 'true' }}
         name: docker-logs
         uses: nick-fields/retry@v2
@@ -318,8 +314,6 @@ jobs:
           timeout_minutes: 30
           max_attempts: 3
           command: bash scripts/ci-integration-test.sh  mongodb
-
-      - run: docker image prune -af --filter=label!=vector-test-runner=true ; docker container prune -f
 
       - if: ${{ github.event_name == 'merge_group' || needs.changes.outputs.all-int == 'true' || needs.changes.outputs.nats == 'true' }}
         name: nats

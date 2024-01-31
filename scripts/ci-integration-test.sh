@@ -27,4 +27,6 @@ cargo vdev -v int test --retries 2 -a "${INTEGRATION}"
 RET=$?
 cargo vdev -v int stop -a "${INTEGRATION}"
 ./scripts/upload-test-results.sh
+# clean up disk space
+docker image prune -af ; docker container prune -f
 exit $RET

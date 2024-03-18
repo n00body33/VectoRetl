@@ -5,7 +5,7 @@ use std::{
     str,
 };
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use chrono::{TimeZone, Utc};
 use futures::{Stream, StreamExt};
 use http::HeaderMap;
@@ -63,8 +63,9 @@ fn test_logs_schema_definition() -> schema::Definition {
 
 impl Arbitrary for LogMsg {
     fn arbitrary(g: &mut Gen) -> Self {
+        let message = String::arbitrary(g);
         LogMsg {
-            message: Bytes::from(String::arbitrary(g)),
+            message: BytesMut::from(message.as_str()),
             status: Bytes::from(String::arbitrary(g)),
             timestamp: Utc
                 .timestamp_millis_opt(u32::arbitrary(g) as i64)
@@ -105,7 +106,7 @@ fn test_decode_log_body() {
         assert_eq!(events.len(), msgs.len());
         for (msg, event) in msgs.into_iter().zip(events.into_iter()) {
             let log = event.as_log();
-            assert_eq!(log["message"], msg.message.into());
+            assert_eq!(log["message"], msg.message.freeze().into());
             assert_eq!(log["status"], msg.status.into());
             assert_eq!(log["timestamp"], msg.timestamp.into());
             assert_eq!(log["hostname"], msg.hostname.into());
@@ -277,7 +278,7 @@ async fn full_payload_v1() {
                     send_with_path(
                         addr,
                         &serde_json::to_string(&[LogMsg {
-                            message: Bytes::from("foo"),
+                            message: BytesMut::from("foo"),
                             timestamp: Utc
                                 .timestamp_opt(123, 0)
                                 .single()
@@ -339,7 +340,7 @@ async fn full_payload_v2() {
                     send_with_path(
                         addr,
                         &serde_json::to_string(&[LogMsg {
-                            message: Bytes::from("foo"),
+                            message: BytesMut::from("foo"),
                             timestamp: Utc
                                 .timestamp_opt(123, 0)
                                 .single()
@@ -401,7 +402,7 @@ async fn no_api_key() {
                     send_with_path(
                         addr,
                         &serde_json::to_string(&[LogMsg {
-                            message: Bytes::from("foo"),
+                            message: BytesMut::from("foo"),
                             timestamp: Utc
                                 .timestamp_opt(123, 0)
                                 .single()
@@ -463,7 +464,7 @@ async fn api_key_in_url() {
                     send_with_path(
                         addr,
                         &serde_json::to_string(&[LogMsg {
-                            message: Bytes::from("bar"),
+                            message: BytesMut::from("bar"),
                             timestamp: Utc
                                 .timestamp_opt(456, 0)
                                 .single()
@@ -528,7 +529,7 @@ async fn api_key_in_query_params() {
                     send_with_path(
                         addr,
                         &serde_json::to_string(&[LogMsg {
-                            message: Bytes::from("bar"),
+                            message: BytesMut::from("bar"),
                             timestamp: Utc
                                 .timestamp_opt(456, 0)
                                 .single()
@@ -599,7 +600,7 @@ async fn api_key_in_header() {
                     send_with_path(
                         addr,
                         &serde_json::to_string(&[LogMsg {
-                            message: Bytes::from("baz"),
+                            message: BytesMut::from("baz"),
                             timestamp: Utc
                                 .timestamp_opt(789, 0)
                                 .single()
@@ -664,7 +665,7 @@ async fn delivery_failure() {
                 send_with_path(
                     addr,
                     &serde_json::to_string(&[LogMsg {
-                        message: Bytes::from("foo"),
+                        message: BytesMut::from("foo"),
                         timestamp: Utc
                             .timestamp_opt(123, 0)
                             .single()
@@ -700,7 +701,7 @@ async fn ignores_disabled_acknowledgements() {
                     send_with_path(
                         addr,
                         &serde_json::to_string(&[LogMsg {
-                            message: Bytes::from("foo"),
+                            message: BytesMut::from("foo"),
                             timestamp: Utc
                                 .timestamp_opt(123, 0)
                                 .single()
@@ -746,7 +747,7 @@ async fn ignores_api_key() {
                     send_with_path(
                         addr,
                         &serde_json::to_string(&[LogMsg {
-                            message: Bytes::from("baz"),
+                            message: BytesMut::from("baz"),
                             timestamp: Utc
                                 .timestamp_opt(789, 0)
                                 .single()
@@ -1386,7 +1387,7 @@ async fn split_outputs() {
                     send_with_path(
                         addr,
                         &serde_json::to_string(&[LogMsg {
-                            message: Bytes::from("baz"),
+                            message: BytesMut::from("baz"),
                             timestamp: Utc
                                 .timestamp_opt(789, 0)
                                 .single()

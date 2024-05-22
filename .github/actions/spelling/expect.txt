@@ -527,6 +527,7 @@ ingesters
 ingestor
 initdb
 initech
+Insertdata
 installdeb
 Instrumentable
 interpolatedstring

@@ -98,6 +98,7 @@ depends = ""
 [workspace]
 members = [
   ".",
+  "xtask",
   "lib/codecs",
   "lib/dnsmsg-parser",
   "lib/docs-renderer",

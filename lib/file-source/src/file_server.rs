@@ -52,6 +52,7 @@ where
     pub remove_after: Option<Duration>,
     pub emitter: E,
     pub handle: tokio::runtime::Handle,
+    pub rotate_wait: Duration,
 }
 
 /// `FileServer` as Source
@@ -114,7 +115,7 @@ where
         }
 
         existing_files.sort_by_key(|(path, _file_id)| {
-            fs::metadata(&path)
+            fs::metadata(path)
                 .and_then(|m| m.created())
                 .map(DateTime::<Utc>::from)
                 .unwrap_or_else(|_| Utc::now())
@@ -206,8 +207,8 @@ where
                                 );
                                 let (old_path, new_path) = (&watcher.path, &path);
                                 if let (Ok(old_modified_time), Ok(new_modified_time)) = (
-                                    fs::metadata(&old_path).and_then(|m| m.modified()),
-                                    fs::metadata(&new_path).and_then(|m| m.modified()),
+                                    fs::metadata(old_path).and_then(|m| m.modified()),
+                                    fs::metadata(new_path).and_then(|m| m.modified()),
                                 ) {
                                     if old_modified_time < new_modified_time {
                                         info!(
@@ -292,11 +293,18 @@ where
                 }
             }
 
+            for (_, watcher) in &mut fp_map {
+                if !watcher.file_findable() && watcher.last_seen().elapsed() > self.rotate_wait {
+                    watcher.set_dead();
+                }
+            }
+
             // A FileWatcher is dead when the underlying file has disappeared.
             // If the FileWatcher is dead we don't retain it; it will be deallocated.
             fp_map.retain(|file_id, watcher| {
                 if watcher.dead() {
-                    self.emitter.emit_file_unwatched(&watcher.path);
+                    self.emitter
+                        .emit_file_unwatched(&watcher.path, watcher.reached_eof());
                     checkpoints.set_dead(*file_id);
                     false
                 } else {
@@ -342,6 +350,9 @@ where
             futures::pin_mut!(sleep);
             match self.handle.block_on(select(shutdown_data, sleep)) {
                 Either::Left((_, _)) => {
+                    self.handle
+                        .block_on(chans.close())
+                        .expect("error closing file_server data channel.");
                     let checkpointer = self
                         .handle
                         .block_on(checkpoint_task_handle)
@@ -441,6 +452,10 @@ async fn checkpoint_writer(
     checkpointer
 }
 
+pub fn calculate_ignore_before(ignore_older_secs: Option<u64>) -> Option<DateTime<Utc>> {
+    ignore_older_secs.map(|secs| Utc::now() - chrono::Duration::seconds(secs as i64))
+}
+
 /// A sentinel type to signal that file server was gracefully shut down.
 ///
 /// The purpose of this type is to clarify the semantics of the result values
@@ -469,8 +484,8 @@ impl TimingStats {
 
     fn report(&self) {
         let total = self.started_at.elapsed();
-        let counted = self.segments.values().sum();
-        let other = self.started_at.elapsed() - counted;
+        let counted: Duration = self.segments.values().sum();
+        let other: Duration = self.started_at.elapsed() - counted;
         let mut ratios = self
             .segments
             .iter()

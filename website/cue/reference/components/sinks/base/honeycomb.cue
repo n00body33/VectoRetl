@@ -5,7 +5,7 @@ base: components: sinks: honeycomb: configuration: {
 		description: """
 			Controls how acknowledgements are handled for this sink.
 
-			See [End-to-end Acknowledgements][e2e_acks] for more information on how Vector handles event acknowledgement.
+			See [End-to-end Acknowledgements][e2e_acks] for more information on how event acknowledgement is handled.
 
 			[e2e_acks]: https://vector.dev/docs/about/under-the-hood/architecture/end-to-end-acknowledgements/
 			"""
@@ -15,8 +15,8 @@ base: components: sinks: honeycomb: configuration: {
 				Whether or not end-to-end acknowledgements are enabled.
 
 				When enabled for a sink, any source connected to that sink, where the source supports
-				end-to-end acknowledgements as well, will wait for events to be acknowledged by the sink
-				before acknowledging them at the source.
+				end-to-end acknowledgements as well, waits for events to be acknowledged by **all
+				connected** sinks before acknowledging them at the source.
 
 				Enabling or disabling acknowledgements at the sink level takes precedence over any global
 				[`acknowledgements`][global_acks] configuration.
@@ -28,9 +28,9 @@ base: components: sinks: honeycomb: configuration: {
 		}
 	}
 	api_key: {
-		description: "The team key that will be used to authenticate against Honeycomb."
+		description: "The API key that is used to authenticate against Honeycomb."
 		required:    true
-		type: string: syntax: "literal"
+		type: string: examples: ["${HONEYCOMB_API_KEY}", "some-api-key"]
 	}
 	batch: {
 		description: "Event batching behavior."
@@ -38,60 +38,80 @@ base: components: sinks: honeycomb: configuration: {
 		type: object: options: {
 			max_bytes: {
 				description: """
-					The maximum size of a batch that will be processed by a sink.
+					The maximum size of a batch that is processed by a sink.
 
 					This is based on the uncompressed size of the batched events, before they are
-					serialized / compressed.
+					serialized/compressed.
 					"""
 				required: false
-				type: uint: {}
+				type: uint: {
+					default: 100000
+					unit:    "bytes"
+				}
 			}
 			max_events: {
-				description: "The maximum size of a batch, in events, before it is flushed."
+				description: "The maximum size of a batch before it is flushed."
 				required:    false
-				type: uint: {}
+				type: uint: unit: "events"
 			}
 			timeout_secs: {
-				description: "The maximum age of a batch, in seconds, before it is flushed."
+				description: "The maximum age of a batch before it is flushed."
 				required:    false
-				type: float: {}
+				type: float: {
+					default: 1.0
+					unit:    "seconds"
+				}
 			}
 		}
 	}
 	dataset: {
-		description: "The dataset that Vector will send logs to."
+		description: "The dataset to which logs are sent."
 		required:    true
-		type: string: syntax: "literal"
+		type: string: examples: ["my-honeycomb-dataset"]
 	}
 	encoding: {
 		description: "Transformations to prepare an event for serialization."
 		required:    false
 		type: object: options: {
 			except_fields: {
-				description: "List of fields that will be excluded from the encoded event."
+				description: "List of fields that are excluded from the encoded event."
 				required:    false
-				type: array: items: type: string: syntax: "literal"
+				type: array: items: type: string: {}
 			}
 			only_fields: {
-				description: "List of fields that will be included in the encoded event."
+				description: "List of fields that are included in the encoded event."
 				required:    false
-				type: array: items: type: string: syntax: "literal"
+				type: array: items: type: string: {}
 			}
 			timestamp_format: {
 				description: "Format used for timestamp fields."
 				required:    false
 				type: string: enum: {
-					rfc3339: "Represent the timestamp as a RFC 3339 timestamp."
-					unix:    "Represent the timestamp as a Unix timestamp."
+					rfc3339:    "Represent the timestamp as a RFC 3339 timestamp."
+					unix:       "Represent the timestamp as a Unix timestamp."
+					unix_float: "Represent the timestamp as a Unix timestamp in floating point."
+					unix_ms:    "Represent the timestamp as a Unix timestamp in milliseconds."
+					unix_ns:    "Represent the timestamp as a Unix timestamp in nanoseconds."
+					unix_us:    "Represent the timestamp as a Unix timestamp in microseconds"
 				}
 			}
+		}
+	}
+	endpoint: {
+		description: "Honeycomb's endpoint to send logs to"
+		required:    false
+		type: string: {
+			default: "https://api.honeycomb.io"
+			examples: ["https://api.honeycomb.io", "https://api.eu1.honeycomb.io"]
 		}
 	}
 	request: {
 		description: """
 			Middleware settings for outbound requests.
 
-			Various settings can be configured, such as concurrency and rate limits, timeouts, etc.
+			Various settings can be configured, such as concurrency and rate limits, timeouts, retry behavior, etc.
+
+			Note that the retry backoff policy follows the Fibonacci sequence.
 			"""
 		required: false
 		type: object: options: {
@@ -103,15 +123,9 @@ base: components: sinks: honeycomb: configuration: {
 					unstable performance and sink behavior. Proceed with caution.
 					"""
 				required: false
-				type: object: {
-					default: {
-						decrease_ratio:      0.9
-						ewma_alpha:          0.4
-						rtt_deviation_scale: 2.5
-					}
-					options: {
-						decrease_ratio: {
-							description: """
+				type: object: options: {
+					decrease_ratio: {
+						description: """
 																The fraction of the current value to set the new concurrency limit when decreasing the limit.
 
 																Valid values are greater than `0` and less than `1`. Smaller values cause the algorithm to scale back rapidly
@@ -119,11 +133,11 @@ base: components: sinks: honeycomb: configuration: {
 
 																Note that the new limit is rounded down after applying this ratio.
 																"""
-							required: false
-							type: float: default: 0.9
-						}
-						ewma_alpha: {
-							description: """
+						required: false
+						type: float: default: 0.9
+					}
+					ewma_alpha: {
+						description: """
 																The weighting of new measurements compared to older measurements.
 
 																Valid values are greater than `0` and less than `1`.
@@ -132,11 +146,31 @@ base: components: sinks: honeycomb: configuration: {
 																the current RTT. Smaller values cause this reference to adjust more slowly, which may be useful if a service has
 																unusually high response variability.
 																"""
-							required: false
-							type: float: default: 0.4
-						}
-						rtt_deviation_scale: {
-							description: """
+						required: false
+						type: float: default: 0.4
+					}
+					initial_concurrency: {
+						description: """
+																The initial concurrency limit to use. If not specified, the initial limit will be 1 (no concurrency).
+
+																It is recommended to set this value to your service's average limit if you're seeing that it takes a
+																long time to ramp up adaptive concurrency after a restart. You can find this value by looking at the
+																`adaptive_concurrency_limit` metric.
+																"""
+						required: false
+						type: uint: default: 1
+					}
+					max_concurrency_limit: {
+						description: """
+																The maximum concurrency limit.
+
+																The adaptive request concurrency limit will not go above this bound. This is put in place as a safeguard.
+																"""
+						required: false
+						type: uint: default: 200
+					}
+					rtt_deviation_scale: {
+						description: """
 																Scale of RTT deviations which are not considered anomalous.
 
 																Valid values are greater than or equal to `0`, and we expect reasonable values to range from `1.0` to `3.0`.
@@ -146,65 +180,114 @@ base: components: sinks: honeycomb: configuration: {
 																can ignore increases in RTT that are within an expected range. This factor is used to scale up the deviation to
 																an appropriate range.  Larger values cause the algorithm to ignore larger increases in the RTT.
 																"""
-							required: false
-							type: float: default: 2.5
-						}
+						required: false
+						type: float: default: 2.5
 					}
 				}
 			}
 			concurrency: {
-				description: "Configuration for outbound request concurrency."
-				required:    false
+				description: """
+					Configuration for outbound request concurrency.
+
+					This can be set either to one of the below enum values or to a positive integer, which denotes
+					a fixed concurrency limit.
+					"""
+				required: false
 				type: {
-					number: {}
 					string: {
-						const:   "adaptive"
-						default: "none"
+						default: "adaptive"
+						enum: {
+							adaptive: """
+															Concurrency will be managed by Vector's [Adaptive Request Concurrency][arc] feature.
+
+															[arc]: https://vector.dev/docs/about/under-the-hood/networking/arc/
+															"""
+							none: """
+															A fixed concurrency of 1.
+
+															Only one request can be outstanding at any given time.
+															"""
+						}
 					}
+					uint: {}
 				}
 			}
 			rate_limit_duration_secs: {
-				description: "The time window, in seconds, used for the `rate_limit_num` option."
+				description: "The time window used for the `rate_limit_num` option."
 				required:    false
-				type: uint: default: 1
+				type: uint: {
+					default: 1
+					unit:    "seconds"
+				}
 			}
 			rate_limit_num: {
 				description: "The maximum number of requests allowed within the `rate_limit_duration_secs` time window."
 				required:    false
-				type: uint: default: 9223372036854775807
+				type: uint: {
+					default: 9223372036854775807
+					unit:    "requests"
+				}
 			}
 			retry_attempts: {
-				description: """
-					The maximum number of retries to make for failed requests.
-
-					The default, for all intents and purposes, represents an infinite number of retries.
-					"""
-				required: false
-				type: uint: default: 9223372036854775807
+				description: "The maximum number of retries to make for failed requests."
+				required:    false
+				type: uint: {
+					default: 9223372036854775807
+					unit:    "retries"
+				}
 			}
 			retry_initial_backoff_secs: {
 				description: """
 					The amount of time to wait before attempting the first retry for a failed request.
 
-					After the first retry has failed, the fibonacci sequence will be used to select future backoffs.
+					After the first retry has failed, the fibonacci sequence is used to select future backoffs.
 					"""
 				required: false
-				type: uint: default: 1
+				type: uint: {
+					default: 1
+					unit:    "seconds"
+				}
+			}
+			retry_jitter_mode: {
+				description: "The jitter mode to use for retry backoff behavior."
+				required:    false
+				type: string: {
+					default: "Full"
+					enum: {
+						Full: """
+															Full jitter.
+
+															The random delay is anywhere from 0 up to the maximum current delay calculated by the backoff
+															strategy.
+
+															Incorporating full jitter into your backoff strategy can greatly reduce the likelihood
+															of creating accidental denial of service (DoS) conditions against your own systems when
+															many clients are recovering from a failure state.
+															"""
+						None: "No jitter."
+					}
+				}
 			}
 			retry_max_duration_secs: {
-				description: "The maximum amount of time, in seconds, to wait between retries."
+				description: "The maximum amount of time to wait between retries."
 				required:    false
-				type: uint: default: 3600
+				type: uint: {
+					default: 30
+					unit:    "seconds"
+				}
 			}
 			timeout_secs: {
 				description: """
-					The maximum time a request can take before being aborted.
+					The time a request can take before being aborted.
 
-					It is highly recommended that you do not lower this value below the service’s internal timeout, as this could
+					Datadog highly recommends that you do not lower this value below the service's internal timeout, as this could
 					create orphaned requests, pile on retries, and result in duplicate data downstream.
 					"""
 				required: false
-				type: uint: default: 60
+				type: uint: {
+					default: 60
+					unit:    "seconds"
+				}
 			}
 		}
 	}

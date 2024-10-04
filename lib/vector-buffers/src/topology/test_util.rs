@@ -72,11 +72,12 @@ impl EventCount for Sample {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)] // The inner _is_ read by the `Debug` impl, but that's ignored
 pub struct BasicError(pub(crate) String);
 
 impl fmt::Display for BasicError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:?}", self)
+        write!(f, "{self:?}")
     }
 }
 

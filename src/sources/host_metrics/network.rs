@@ -4,19 +4,21 @@ use heim::net::os::linux::IoCountersExt;
 #[cfg(windows)]
 use heim::net::os::windows::IoCountersExt;
 use heim::units::information::byte;
-use vector_config::configurable_component;
-use vector_core::metric_tags;
+use vector_lib::configurable::configurable_component;
+use vector_lib::metric_tags;
 
 use crate::internal_events::HostMetricsScrapeDetailError;
 
-use super::{filter_result, FilterList, HostMetrics};
+use super::{default_all_devices, example_devices, filter_result, FilterList, HostMetrics};
 
-/// Options for the “network” metrics collector.
+/// Options for the network metrics collector.
 #[configurable_component]
 #[derive(Clone, Debug, Default)]
 pub struct NetworkConfig {
-    /// Lists of device name patterns to include or exclude.
-    #[serde(default)]
+    /// Lists of device name patterns to include or exclude in gathering
+    /// network utilization metrics.
+    #[serde(default = "default_all_devices")]
+    #[configurable(metadata(docs::examples = "example_devices()"))]
     devices: FilterList,
 }
 

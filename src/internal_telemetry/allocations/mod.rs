@@ -2,9 +2,8 @@
 
 mod allocator;
 use std::{
-    cell::Cell,
     sync::{
-        atomic::{AtomicI64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Mutex,
     },
     thread,
@@ -12,7 +11,7 @@ use std::{
 };
 
 use arr_macro::arr;
-use metrics::gauge;
+use metrics::{counter, gauge};
 use rand_distr::num_traits::ToPrimitive;
 
 use self::allocator::Tracer;
@@ -21,49 +20,66 @@ pub(crate) use self::allocator::{
     without_allocation_tracing, AllocationGroupId, AllocationLayer, GroupedTraceableAllocator,
 };
 
-use crossbeam_utils::CachePadded;
-
 const NUM_GROUPS: usize = 128;
-const NUM_BUCKETS: usize = 8;
-/// These arrays represent the memory usage for each group per thread.
-///
-/// Each thread is meant to update it's own group statistics, which significantly reduces atomic contention.
-/// We pad each Atomic to reduce false sharing effects.
-///
-/// TODO:
-///
-/// Currently, we reach atomic contention once the number of threads exceeds 8. One potential solution
-/// involves using thread locals to track memory stats.
-static GROUP_MEM_STATS: [[CachePadded<AtomicI64>; NUM_GROUPS]; NUM_BUCKETS] = [
-    arr![CachePadded::new(AtomicI64::new(0)); 128],
-    arr![CachePadded::new(AtomicI64::new(0)); 128],
-    arr![CachePadded::new(AtomicI64::new(0)); 128],
-    arr![CachePadded::new(AtomicI64::new(0)); 128],
-    arr![CachePadded::new(AtomicI64::new(0)); 128],
-    arr![CachePadded::new(AtomicI64::new(0)); 128],
-    arr![CachePadded::new(AtomicI64::new(0)); 128],
-    arr![CachePadded::new(AtomicI64::new(0)); 128],
-];
 
-// TODO: Replace this with [`std::thread::ThreadId::as_u64`] once it is stabilized.
-static THREAD_COUNTER: AtomicUsize = AtomicUsize::new(0);
+// Allocations are not tracked during startup.
+// We use the Relaxed ordering for both stores and loads of this atomic as no other threads exist when
+// this code is running, and all future threads will have a happens-after relationship with
+// this thread -- the main thread -- ensuring that they see the latest value of TRACK_ALLOCATIONS.
+pub static TRACK_ALLOCATIONS: AtomicBool = AtomicBool::new(false);
+
+pub fn is_allocation_tracing_enabled() -> bool {
+    TRACK_ALLOCATIONS.load(Ordering::Acquire)
+}
+
+/// Track allocations and deallocations separately.
+struct GroupMemStatsStorage {
+    allocations: [AtomicU64; NUM_GROUPS],
+    deallocations: [AtomicU64; NUM_GROUPS],
+}
+
+// Reporting interval in milliseconds.
+pub static REPORTING_INTERVAL_MS: AtomicU64 = AtomicU64::new(5000);
+
+/// A registry for tracking each thread's group memory statistics.
+static THREAD_LOCAL_REFS: Mutex<Vec<&'static GroupMemStatsStorage>> = Mutex::new(Vec::new());
+
+/// Group memory statistics per thread.
+struct GroupMemStats {
+    stats: &'static GroupMemStatsStorage,
+}
+
+impl GroupMemStats {
+    /// Allocates a [`GroupMemStatsStorage`], and updates the global [`THREAD_LOCAL_REFS`] registry
+    /// with a reference to this newly allocated memory.
+    pub fn new() -> Self {
+        let mut mutex = THREAD_LOCAL_REFS.lock().unwrap();
+        let stats_ref: &'static GroupMemStatsStorage = Box::leak(Box::new(GroupMemStatsStorage {
+            allocations: arr![AtomicU64::new(0) ; 128],
+            deallocations: arr![AtomicU64::new(0) ; 128],
+        }));
+        let group_mem_stats = GroupMemStats { stats: stats_ref };
+        mutex.push(stats_ref);
+        group_mem_stats
+    }
+}
 
 thread_local! {
-    static THREAD_ID: Cell<usize> = const { Cell::new(0) };
+    static GROUP_MEM_STATS: GroupMemStats = GroupMemStats::new();
 }
-// By using the Option type, we can do statics w/o the need of other creates such as lazy_static
+
 struct GroupInfo {
-    component_kind: Option<String>,
-    component_type: Option<String>,
-    component_id: Option<String>,
+    component_kind: String,
+    component_type: String,
+    component_id: String,
 }
 
 impl GroupInfo {
     const fn new() -> Self {
         Self {
-            component_id: None,
-            component_kind: None,
-            component_type: None,
+            component_id: String::new(),
+            component_kind: String::new(),
+            component_type: String::new(),
         }
     }
 }
@@ -81,48 +97,85 @@ pub struct MainTracer;
 impl Tracer for MainTracer {
     #[inline(always)]
     fn trace_allocation(&self, object_size: usize, group_id: AllocationGroupId) {
-        GROUP_MEM_STATS[THREAD_ID.with(|t| t.get()) % 8][group_id.as_raw()]
-            .fetch_add(object_size as i64, Ordering::Relaxed);
+        // Handle the case when thread local destructor is ran.
+        _ = GROUP_MEM_STATS.try_with(|t| {
+            t.stats.allocations[group_id.as_raw() as usize]
+                .fetch_add(object_size as u64, Ordering::Relaxed)
+        });
     }
 
     #[inline(always)]
     fn trace_deallocation(&self, object_size: usize, source_group_id: AllocationGroupId) {
-        GROUP_MEM_STATS[THREAD_ID.with(|t| t.get()) % 8][source_group_id.as_raw()]
-            .fetch_sub(object_size as i64, Ordering::Relaxed);
+        // Handle the case when thread local destructor is ran.
+        _ = GROUP_MEM_STATS.try_with(|t| {
+            t.stats.deallocations[source_group_id.as_raw() as usize]
+                .fetch_add(object_size as u64, Ordering::Relaxed)
+        });
     }
 }
 
 /// Initializes allocation tracing.
 pub fn init_allocation_tracing() {
+    for group in &GROUP_INFO {
+        let mut writer = group.lock().unwrap();
+        *writer = GroupInfo {
+            component_id: "root".to_string(),
+            component_kind: "root".to_string(),
+            component_type: "root".to_string(),
+        };
+    }
     let alloc_processor = thread::Builder::new().name("vector-alloc-processor".to_string());
     alloc_processor
         .spawn(|| {
             without_allocation_tracing(|| loop {
-                for group_idx in 0..NUM_GROUPS {
-                    let mut mem_used = 0;
-                    for bucket in &GROUP_MEM_STATS {
-                        mem_used += bucket[group_idx].load(Ordering::Relaxed);
+                for (group_idx, group) in GROUP_INFO.iter().enumerate() {
+                    let mut allocations_diff = 0;
+                    let mut deallocations_diff = 0;
+                    let mutex = THREAD_LOCAL_REFS.lock().unwrap();
+                    for idx in 0..mutex.len() {
+                        allocations_diff +=
+                            mutex[idx].allocations[group_idx].swap(0, Ordering::Relaxed);
+                        deallocations_diff +=
+                            mutex[idx].deallocations[group_idx].swap(0, Ordering::Relaxed);
                     }
-                    if mem_used == 0 {
+                    if allocations_diff == 0 && deallocations_diff == 0 {
                         continue;
                     }
-                    let group_info = GROUP_INFO[group_idx].lock().unwrap();
-                    gauge!(
-                        "component_allocated_bytes",
-                        mem_used.to_f64().expect("failed to convert group_id from int to float"),
-                        "component_kind" => group_info.component_kind.clone().unwrap_or_else(|| "root".to_string()),
-                        "component_type" => group_info.component_type.clone().unwrap_or_else(|| "root".to_string()),
-                        "component_id" => group_info.component_id.clone().unwrap_or_else(|| "root".to_string()));
+                    let mem_used_diff = allocations_diff as i64 - deallocations_diff as i64;
+                    let group_info = group.lock().unwrap();
+                    if allocations_diff > 0 {
+                        counter!(
+                            "component_allocated_bytes_total", "component_kind" => group_info.component_kind.clone(),
+                            "component_type" => group_info.component_type.clone(),
+                            "component_id" => group_info.component_id.clone()).increment(allocations_diff);
+                    }
+                    if deallocations_diff > 0 {
+                        counter!(
+                            "component_deallocated_bytes_total", "component_kind" => group_info.component_kind.clone(),
+                            "component_type" => group_info.component_type.clone(),
+                            "component_id" => group_info.component_id.clone()).increment(deallocations_diff);
+                    }
+                    if mem_used_diff > 0 {
+                        gauge!(
+                            "component_allocated_bytes", "component_type" => group_info.component_type.clone(),
+                            "component_id" => group_info.component_id.clone(),
+                            "component_kind" => group_info.component_kind.clone())
+                            .increment(mem_used_diff.to_f64().expect("failed to convert mem_used from int to float"));
+                    }
+                    if mem_used_diff < 0 {
+                        gauge!(
+                            "component_allocated_bytes", "component_type" => group_info.component_type.clone(),
+                            "component_id" => group_info.component_id.clone(),
+                            "component_kind" => group_info.component_kind.clone())
+                            .decrement(-mem_used_diff.to_f64().expect("failed to convert mem_used from int to float"));
+                    }
                 }
-                thread::sleep(Duration::from_millis(5000));
+                thread::sleep(Duration::from_millis(
+                    REPORTING_INTERVAL_MS.load(Ordering::Relaxed),
+                ));
             })
         })
         .unwrap();
-}
-
-/// Initializes the thread local ID.
-pub fn init_thread_id() {
-    THREAD_ID.with(|t| t.replace(THREAD_COUNTER.fetch_add(1, Ordering::Relaxed)));
 }
 
 /// Acquires an allocation group ID.
@@ -137,22 +190,22 @@ pub fn acquire_allocation_group_id(
     component_type: String,
     component_kind: String,
 ) -> AllocationGroupId {
-    let group_id =
-        AllocationGroupId::register().expect("failed to register allocation group token");
-    let idx = group_id.as_raw();
-    match GROUP_INFO.get(idx) {
-        Some(mutex) => {
-            let mut writer = mutex.lock().unwrap();
+    if let Some(group_id) = AllocationGroupId::register() {
+        if let Some(group_lock) = GROUP_INFO.get(group_id.as_raw() as usize) {
+            let mut writer = group_lock.lock().unwrap();
             *writer = GroupInfo {
-                component_id: Some(component_id),
-                component_kind: Some(component_kind),
-                component_type: Some(component_type),
+                component_id,
+                component_kind,
+                component_type,
             };
-            group_id
-        }
-        None => {
-            info!("Maximum number of registrable allocation group IDs reached ({}). Allocations for component '{}' will be attributed to the root allocation group.", NUM_GROUPS, component_id);
-            AllocationGroupId::ROOT
+
+            return group_id;
         }
     }
+
+    // TODO: Technically, `NUM_GROUPS` is lower (128) than the upper bound for the
+    // `AllocationGroupId::register` call itself (253), so we can hardcode `NUM_GROUPS` here knowing
+    // it's the lower of the two values and will trigger first.. but this may not always be true.
+    warn!("Maximum number of registrable allocation group IDs reached ({}). Allocations for component '{}' will be attributed to the root allocation group.", NUM_GROUPS, component_id);
+    AllocationGroupId::ROOT
 }

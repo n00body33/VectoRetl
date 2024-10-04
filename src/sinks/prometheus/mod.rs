@@ -1,19 +1,18 @@
-use vector_common::sensitive_string::SensitiveString;
 #[cfg(test)]
-use vector_core::event::Metric;
+use vector_lib::event::Metric;
+use vector_lib::sensitive_string::SensitiveString;
 
 mod collector;
-pub(crate) mod exporter;
-pub(crate) mod remote_write;
+pub mod exporter;
+pub mod remote_write;
 
-use vector_config::configurable_component;
-
-use crate::aws::AwsAuthentication;
+use vector_lib::configurable::configurable_component;
 
 /// Authentication strategies.
 #[configurable_component]
 #[derive(Clone, Debug)]
 #[serde(deny_unknown_fields, rename_all = "snake_case", tag = "strategy")]
+#[configurable(metadata(docs::enum_tag_description = "The authentication strategy to use."))]
 pub enum PrometheusRemoteWriteAuth {
     /// HTTP Basic Authentication.
     Basic {
@@ -32,8 +31,9 @@ pub enum PrometheusRemoteWriteAuth {
         token: SensitiveString,
     },
 
+    #[cfg(feature = "aws-core")]
     /// Amazon Prometheus Service-specific authentication.
-    Aws(#[configurable(derived)] AwsAuthentication),
+    Aws(crate::aws::AwsAuthentication),
 }
 
 fn default_histogram_buckets() -> Vec<f64> {

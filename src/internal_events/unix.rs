@@ -1,12 +1,11 @@
 use std::{io::Error, path::Path};
 
 use metrics::counter;
-use vector_common::internal_event::{
-    error_stage, error_type, ComponentEventsDropped, UNINTENTIONAL,
+use vector_lib::internal_event::{
+    error_stage, error_type, ComponentEventsDropped, InternalEvent, UNINTENTIONAL,
 };
-use vector_core::internal_event::InternalEvent;
 
-use crate::{emit, internal_events::SocketOutgoingConnectionError};
+use crate::internal_events::SocketOutgoingConnectionError;
 
 #[derive(Debug)]
 pub struct UnixSocketConnectionEstablished<'a> {
@@ -16,7 +15,7 @@ pub struct UnixSocketConnectionEstablished<'a> {
 impl InternalEvent for UnixSocketConnectionEstablished<'_> {
     fn emit(self) {
         debug!(message = "Connected.", path = ?self.path);
-        counter!("connection_established_total", 1, "mode" => "unix");
+        counter!("connection_established_total", "mode" => "unix").increment(1);
     }
 }
 
@@ -30,8 +29,6 @@ impl<E: std::error::Error> InternalEvent for UnixSocketOutgoingConnectionError<E
         // ## skip check-duplicate-events ##
         // ## skip check-validity-events ##
         emit!(SocketOutgoingConnectionError { error: self.error });
-        // deprecated
-        counter!("connection_failed_total", 1, "mode" => "unix");
     }
 }
 
@@ -52,12 +49,11 @@ impl<E: std::fmt::Display> InternalEvent for UnixSocketError<'_, E> {
             internal_log_rate_limit = true,
         );
         counter!(
-            "component_errors_total", 1,
+            "component_errors_total",
             "error_type" => error_type::CONNECTION_FAILED,
             "stage" => error_stage::PROCESSING,
-        );
-        // deprecated
-        counter!("connection_errors_total", 1, "mode" => "unix");
+        )
+        .increment(1);
     }
 }
 
@@ -79,12 +75,40 @@ impl<E: std::fmt::Display> InternalEvent for UnixSocketSendError<'_, E> {
             internal_log_rate_limit = true,
         );
         counter!(
-            "component_errors_total", 1,
+            "component_errors_total",
             "error_type" => error_type::WRITER_FAILED,
             "stage" => error_stage::SENDING,
+        )
+        .increment(1);
+
+        emit!(ComponentEventsDropped::<UNINTENTIONAL> { count: 1, reason });
+    }
+}
+
+#[derive(Debug)]
+pub struct UnixSendIncompleteError {
+    pub data_size: usize,
+    pub sent: usize,
+}
+
+impl InternalEvent for UnixSendIncompleteError {
+    fn emit(self) {
+        let reason = "Could not send all data in one Unix datagram.";
+        error!(
+            message = reason,
+            data_size = self.data_size,
+            sent = self.sent,
+            dropped = self.data_size - self.sent,
+            error_type = error_type::WRITER_FAILED,
+            stage = error_stage::SENDING,
+            internal_log_rate_limit = true,
         );
-        // deprecated
-        counter!("connection_errors_total", 1, "mode" => "unix");
+        counter!(
+            "component_errors_total",
+            "error_type" => error_type::WRITER_FAILED,
+            "stage" => error_stage::SENDING,
+        )
+        .increment(1);
 
         emit!(ComponentEventsDropped::<UNINTENTIONAL> { count: 1, reason });
     }
@@ -108,10 +132,11 @@ impl<'a> InternalEvent for UnixSocketFileDeleteError<'a> {
             internal_log_rate_limit = true,
         );
         counter!(
-            "component_errors_total", 1,
+            "component_errors_total",
             "error_code" => "delete_socket_file",
             "error_type" => error_type::WRITER_FAILED,
             "stage" => error_stage::PROCESSING,
-        );
+        )
+        .increment(1);
     }
 }

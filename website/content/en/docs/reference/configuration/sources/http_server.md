@@ -1,9 +1,9 @@
 ---
 title: HTTP Server
-description: Receive logs emitted by an [HTTP](https://en.wikipedia.org/wiki/Hypertext_Transfer_Protocol#Client_request) server.
-kind: source
+description: Receive observability data from an [HTTP client request](https://en.wikipedia.org/wiki/Hypertext_Transfer_Protocol#Client_request)
+component_kind: source
 layout: component
-tags: ["http", "server", "component", "source", "logs"]
+tags: ["http", "server", "component", "source", "logs", "metrics", "traces"]
 aliases: ["/docs/reference/configuration/sources/http"]
 ---
 

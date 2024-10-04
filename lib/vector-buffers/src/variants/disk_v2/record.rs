@@ -20,7 +20,7 @@ pub enum RecordStatus {
     /// The record was able to be read from the buffer, and the checksum is valid.
     ///
     /// Contains the ID for the given record, as well as the metadata.
-    Valid { id: u64, metadata: u32 },
+    Valid { id: u64 },
     /// The record was able to be read from the buffer, but the checksum was not valid.
     Corrupted { calculated: u32, actual: u32 },
     /// The record was not able to be read from the buffer due to an error during deserialization.
@@ -142,10 +142,7 @@ impl<'a> ArchivedRecord<'a> {
     pub fn verify_checksum(&self, checksummer: &Hasher) -> RecordStatus {
         let calculated = generate_checksum(checksummer, self.id, self.metadata, &self.payload);
         if self.checksum == calculated {
-            RecordStatus::Valid {
-                id: self.id,
-                metadata: self.metadata,
-            }
+            RecordStatus::Valid { id: self.id }
         } else {
             RecordStatus::Corrupted {
                 calculated,
@@ -172,7 +169,7 @@ fn generate_checksum(checksummer: &Hasher, id: u64, metadata: u32, payload: &[u8
 ///
 /// If a record archive was able to be read from the buffer, then the status will indicate whether
 /// or not the checksum in the record matched the recalculated checksum.  Otherwise, the
-/// deserialization error encounted will be provided, which describes the error in a more verbose,
+/// deserialization error encountered will be provided, which describes the error in a more verbose,
 /// debugging-oriented fashion.
 #[cfg_attr(test, instrument(skip_all, level = "trace"))]
 pub fn validate_record_archive(buf: &[u8], checksummer: &Hasher) -> RecordStatus {
@@ -188,7 +185,7 @@ pub fn validate_record_archive(buf: &[u8], checksummer: &Hasher) -> RecordStatus
 /// it is also assumed that the provided `buf` has an alignment of 16 bytes.
 ///
 /// If a record archive was able to be read from the buffer, then a reference to its archived form
-/// will be returned.  Otherwise, the deserialization error encounted will be provided, which describes the error in a more verbose,
+/// will be returned.  Otherwise, the deserialization error encountered will be provided, which describes the error in a more verbose,
 /// debugging-oriented fashion.
 #[cfg_attr(test, instrument(skip_all, level = "trace"))]
 pub fn try_as_record_archive(buf: &[u8]) -> Result<&ArchivedRecord<'_>, DeserializeError> {

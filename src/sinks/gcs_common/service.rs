@@ -8,13 +8,13 @@ use http::{
 };
 use hyper::Body;
 use tower::Service;
-use vector_common::request_metadata::{MetaDescriptive, RequestMetadata};
-use vector_core::{internal_event::CountByteSize, stream::DriverResponse};
+use vector_lib::request_metadata::{GroupedCountByteSize, MetaDescriptive, RequestMetadata};
+use vector_lib::stream::DriverResponse;
 
 use crate::{
     event::{EventFinalizers, EventStatus, Finalizable},
     gcp::GcpAuthenticator,
-    http::{get_http_scheme_from_uri, HttpClient, HttpError},
+    http::{HttpClient, HttpError},
 };
 
 #[derive(Debug, Clone)]
@@ -50,8 +50,12 @@ impl Finalizable for GcsRequest {
 }
 
 impl MetaDescriptive for GcsRequest {
-    fn get_metadata(&self) -> RequestMetadata {
-        self.metadata
+    fn get_metadata(&self) -> &RequestMetadata {
+        &self.metadata
+    }
+
+    fn metadata_mut(&mut self) -> &mut RequestMetadata {
+        &mut self.metadata
     }
 }
 
@@ -70,7 +74,6 @@ pub struct GcsRequestSettings {
 #[derive(Debug)]
 pub struct GcsResponse {
     pub inner: http::Response<Body>,
-    pub protocol: &'static str,
     pub metadata: RequestMetadata,
 }
 
@@ -85,15 +88,12 @@ impl DriverResponse for GcsResponse {
         }
     }
 
-    fn events_sent(&self) -> CountByteSize {
-        CountByteSize(
-            self.metadata.event_count(),
-            self.metadata.events_estimated_json_encoded_byte_size(),
-        )
+    fn events_sent(&self) -> &GroupedCountByteSize {
+        self.metadata.events_estimated_json_encoded_byte_size()
     }
 
-    fn bytes_sent(&self) -> Option<(usize, &str)> {
-        Some((self.metadata.request_encoded_size(), self.protocol))
+    fn bytes_sent(&self) -> Option<usize> {
+        Some(self.metadata.request_encoded_size())
     }
 }
 
@@ -112,10 +112,9 @@ impl Service<GcsRequest> for GcsService {
         let settings = request.settings;
         let metadata = request.metadata;
 
-        let uri = format!("{}{}", self.base_url, request.key)
-            .parse::<Uri>()
-            .unwrap();
-        let protocol = get_http_scheme_from_uri(&uri);
+        let uri = merge_url_and_key(&self.base_url, &request.key);
+
+        let uri = uri.parse::<Uri>().unwrap();
 
         let mut builder = Request::put(uri);
         let headers = builder.headers_mut().unwrap();
@@ -139,11 +138,39 @@ impl Service<GcsRequest> for GcsService {
         let mut client = self.client.clone();
         Box::pin(async move {
             let result = client.call(http_request).await;
-            result.map(|inner| GcsResponse {
-                inner,
-                protocol,
-                metadata,
-            })
+            result.map(|inner| GcsResponse { inner, metadata })
         })
+    }
+}
+
+/// converts // to / between the base url and the key if necessary
+fn merge_url_and_key(base_url: &str, key: &str) -> String {
+    let base_url = base_url.strip_suffix('/').unwrap_or(base_url);
+    let key = key.strip_prefix('/').unwrap_or(key);
+    format!("{base_url}/{key}")
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::sinks::gcs_common::service::merge_url_and_key;
+
+    #[test]
+    fn merge_base_url_and_key() {
+        assert_eq!(
+            "https://baseurl/key",
+            merge_url_and_key("https://baseurl/", "/key")
+        );
+        assert_eq!(
+            "https://baseurl/key",
+            merge_url_and_key("https://baseurl/", "key")
+        );
+        assert_eq!(
+            "https://baseurl/key",
+            merge_url_and_key("https://baseurl", "/key")
+        );
+        assert_eq!(
+            "https://baseurl/key",
+            merge_url_and_key("https://baseurl", "key")
+        );
     }
 }

@@ -1,14 +1,17 @@
+use http::Uri;
 use std::collections::HashMap;
 use tokio::time::Duration;
+use vector_lib::config::LogNamespace;
 use warp::{http::HeaderMap, Filter};
 
+use crate::components::validation::prelude::*;
 use crate::sources::util::http::HttpMethod;
 use crate::{serde::default_decoding, serde::default_framing_message_based};
-use codecs::decoding::{
+use vector_lib::codecs::decoding::{
     CharacterDelimitedDecoderOptions, DeserializerConfig, FramingConfig,
-    NewlineDelimitedDecoderOptions,
 };
-use vector_core::event::Event;
+use vector_lib::codecs::CharacterDelimitedDecoderConfig;
+use vector_lib::event::Event;
 
 use super::HttpClientConfig;
 use crate::test_util::{
@@ -16,7 +19,9 @@ use crate::test_util::{
     next_addr, test_generate_config, wait_for_tcp,
 };
 
-pub(crate) const INTERVAL_SECS: u64 = 1;
+pub(crate) const INTERVAL: Duration = Duration::from_secs(1);
+
+pub(crate) const TIMEOUT: Duration = Duration::from_secs(1);
 
 /// The happy path should yield at least one event and must emit the required internal events for sources.
 pub(crate) async fn run_compliance(config: HttpClientConfig) -> Vec<Event> {
@@ -34,6 +39,39 @@ fn http_client_generate_config() {
     test_generate_config::<HttpClientConfig>();
 }
 
+impl ValidatableComponent for HttpClientConfig {
+    fn validation_configuration() -> ValidationConfiguration {
+        let uri = Uri::from_static("http://127.0.0.1:9898");
+
+        let config = Self {
+            endpoint: uri.to_string(),
+            interval: Duration::from_secs(1),
+            timeout: Duration::from_secs(1),
+            decoding: DeserializerConfig::Json(Default::default()),
+            ..Default::default()
+        };
+        let log_namespace: LogNamespace = config.log_namespace.unwrap_or_default().into();
+
+        let external_resource = ExternalResource::new(
+            ResourceDirection::Pull,
+            HttpResourceConfig::from_parts(uri, Some(config.method.into())),
+            config.get_decoding_config(None),
+        );
+
+        ValidationConfiguration::from_source(
+            Self::NAME,
+            log_namespace,
+            vec![ComponentTestCaseConfig::from_source(
+                config,
+                None,
+                Some(external_resource),
+            )],
+        )
+    }
+}
+
+register_validatable_component!(HttpClientConfig);
+
 /// Bytes should be decoded and HTTP header set to text/plain.
 #[tokio::test]
 async fn bytes_decoding() {
@@ -48,7 +86,8 @@ async fn bytes_decoding() {
 
     run_compliance(HttpClientConfig {
         endpoint: format!("http://{}/endpoint", in_addr),
-        scrape_interval_secs: INTERVAL_SECS,
+        interval: INTERVAL,
+        timeout: TIMEOUT,
         query: HashMap::new(),
         decoding: default_decoding(),
         framing: default_framing_message_based(),
@@ -76,12 +115,11 @@ async fn json_decoding_newline_delimited() {
 
     run_compliance(HttpClientConfig {
         endpoint: format!("http://{}/endpoint", in_addr),
-        scrape_interval_secs: INTERVAL_SECS,
+        interval: INTERVAL,
+        timeout: TIMEOUT,
         query: HashMap::new(),
-        decoding: DeserializerConfig::Json,
-        framing: FramingConfig::NewlineDelimited {
-            newline_delimited: NewlineDelimitedDecoderOptions::default(),
-        },
+        decoding: DeserializerConfig::Json(Default::default()),
+        framing: FramingConfig::NewlineDelimited(Default::default()),
         headers: HashMap::new(),
         method: HttpMethod::Get,
         tls: None,
@@ -106,15 +144,16 @@ async fn json_decoding_character_delimited() {
 
     run_compliance(HttpClientConfig {
         endpoint: format!("http://{}/endpoint", in_addr),
-        scrape_interval_secs: INTERVAL_SECS,
+        interval: INTERVAL,
+        timeout: TIMEOUT,
         query: HashMap::new(),
-        decoding: DeserializerConfig::Json,
-        framing: FramingConfig::CharacterDelimited {
+        decoding: DeserializerConfig::Json(Default::default()),
+        framing: FramingConfig::CharacterDelimited(CharacterDelimitedDecoderConfig {
             character_delimited: CharacterDelimitedDecoderOptions {
                 delimiter: b',',
                 max_length: Some(usize::MAX),
             },
-        },
+        }),
         headers: HashMap::new(),
         method: HttpMethod::Get,
         tls: None,
@@ -138,7 +177,8 @@ async fn request_query_applied() {
 
     let events = run_compliance(HttpClientConfig {
         endpoint: format!("http://{}/endpoint?key1=val1", in_addr),
-        scrape_interval_secs: INTERVAL_SECS,
+        interval: INTERVAL,
+        timeout: TIMEOUT,
         query: HashMap::from([
             ("key1".to_string(), vec!["val2".to_string()]),
             (
@@ -146,7 +186,7 @@ async fn request_query_applied() {
                 vec!["val1".to_string(), "val2".to_string()],
             ),
         ]),
-        decoding: DeserializerConfig::Json,
+        decoding: DeserializerConfig::Json(Default::default()),
         framing: default_framing_message_based(),
         headers: HashMap::new(),
         method: HttpMethod::Get,
@@ -175,9 +215,7 @@ async fn request_query_applied() {
         for (k, v) in
             url::form_urlencoded::parse(query.as_bytes().expect("byte conversion should succeed"))
         {
-            got.entry(k.to_string())
-                .or_insert_with(Vec::new)
-                .push(v.to_string());
+            got.entry(k.to_string()).or_default().push(v.to_string());
         }
         for v in got.values_mut() {
             v.sort();
@@ -206,7 +244,8 @@ async fn headers_applied() {
 
     run_compliance(HttpClientConfig {
         endpoint: format!("http://{}/endpoint", in_addr),
-        scrape_interval_secs: INTERVAL_SECS,
+        interval: INTERVAL,
+        timeout: TIMEOUT,
         query: HashMap::new(),
         decoding: default_decoding(),
         framing: default_framing_message_based(),
@@ -237,7 +276,8 @@ async fn accept_header_override() {
 
     run_compliance(HttpClientConfig {
         endpoint: format!("http://{}/endpoint", in_addr),
-        scrape_interval_secs: INTERVAL_SECS,
+        interval: INTERVAL,
+        timeout: TIMEOUT,
         query: HashMap::new(),
         decoding: DeserializerConfig::Bytes,
         framing: default_framing_message_based(),

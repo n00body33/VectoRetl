@@ -13,6 +13,7 @@ components: sources: dnstap: {
 	}
 
 	features: {
+		auto_generated:   true
 		acknowledgements: false
 		multiline: enabled: false
 		receive: {
@@ -25,109 +26,50 @@ components: sources: dnstap: {
 					}
 					direction: "incoming"
 					port:      0
-					protocols: ["unix"]
+					protocols: ["unix", "tcp"]
 					socket: "/run/bind/dnstap.sock"
-					ssl:    "disabled"
+					ssl:    "optional"
 				}
 			}
-			tls: enabled: false
+			receive_buffer_bytes: {
+				enabled:       true
+				relevant_when: "mode = `tcp`"
+			}
+			keepalive: enabled: true
+			tls: {
+				enabled:                 true
+				can_verify_certificate:  true
+				can_add_client_metadata: true
+				enabled_default:         false
+			}
 		}
 	}
 
 	support: {
-		targets: {
-			"x86_64-pc-windows-msv": false
-		}
-
 		requirements: []
 		warnings: []
 		notices: []
 	}
 
-	configuration: {
-		max_frame_length: {
-			common:      false
-			description: "Max dnstap frame length that the dnstap source can handle."
-			required:    false
-			type: uint: {
-				default: 102400
-				unit:    "bytes"
-			}
-		}
-		socket_path: {
-			description: """
-				Absolute path of server socket file to which the DNS server is
-				configured to send dnstap data. The socket file will be created
-				by dnstap source component automatically upon startup.
-				"""
-			required: true
-			type: string: {
-				examples: ["/run/bind/dnstap.sock"]
-				syntax: "file_system_path"
-			}
-		}
-		socket_file_mode: {
-			common: true
-			description: """
-				Unix file mode bits to be applied to server socket file
-				as its designated file permissions.
-				Note that the file mode value can be specified in any numeric format
-				supported by TOML, but it'd be more intuitive to use an octal number.
-				Also note that the value specified must be between `0o700` and `0o777`.
-				"""
-			required: false
-			type: uint: {
-				default: null
-				unit:    null
-				examples: [0o777, 0o754, 508]
-			}
-		}
+	configuration: base.components.sources.dnstap.configuration & {
 		socket_receive_buffer_size: {
-			common: false
-			description: """
-				Set receive buffer size of server Unix socket if specified.
-				No change to the default size if omitted.
-				"""
-			required: false
-			type: uint: {
-				default: null
-				unit:    "bytes"
-			}
 			warnings: [
 				"""
-					System-wide setting of max socket receive buffer size
-					(i.e. value of '/proc/sys/net/core/rmem_max' on Linux)
-					may need adjustment accordingly.
+					System-wide setting of maximum socket send buffer size (i.e. value of '/proc/sys/net/core/wmem_max' on Linux) may need adjustment accordingly.
 					""",
 			]
 		}
+
 		socket_send_buffer_size: {
-			common: false
-			description: """
-				Set send buffer size of server Unix socket if specified.
-				No change to the default size if omitted.
-				"""
-			required: false
-			type: uint: {
-				default: null
-				unit:    "bytes"
-			}
 			warnings: [
 				"""
-					System-wide setting of max socket send buffer size
-					(i.e. value of '/proc/sys/net/core/wmem_max' on Linux)
-					may need adjustment accordingly.
+					System-wide setting of maximum socket send buffer size (i.e. value of '/proc/sys/net/core/wmem_max' on Linux) may need adjustment accordingly.
 					""",
 			]
 		}
-		raw_data_only: {
-			common: false
-			description: """
-				Whether or not to write out raw dnstap frame data directly
-				(to be encoded in Base64) without any parsing and formatting.
-				"""
-			required: false
-			type: bool: default: false
+
+		socket_file_mode: {
+			type: uint: examples: [0o777, 0o754, 0o777]
 		}
 	}
 
@@ -879,8 +821,47 @@ components: sources: dnstap: {
 										]
 										"udpPayloadSize": 4096
 									},
+									{
+										"do":            false
+										"ednsVersion":   0
+										"extendedRcode": 0
+										"options": [
+											{
+												"optCode":  10
+												"optName":  "Cookie"
+												"optValue": "hbbDFmHUM9wBAAAAX1q1McL4KhalWTS3"
+											},
+										]
+										"ede": [
+											{
+												"infoCode":  9
+												"purpose":   "DNSKEY Missing"
+												"extraText": "Additional description"
+											},
+										]
+										"udpPayloadSize": 4096
+									},
 								]
-								options: {}
+								options: {
+									ede: {
+										required:    false
+										description: """
+										Extended DNS errors. Provides additional information about
+										the DNS failure. See [RFC 8914](\(urls.rfc_8914)) for
+										detailed information.
+										"""
+										type: array: items: type: object: {
+											examples: [
+												{
+													"infoCode":  9
+													"purpose":   "DNSKEY Missing"
+													"extraText": "Additional description"
+												},
+											]
+											options: {}
+										}
+									}
+								}
 							}
 						}
 						zone: {
@@ -913,6 +894,7 @@ components: sources: dnstap: {
 		{
 			title: "Dnstap events for a pair of regular DNS query and response."
 			configuration: {
+				mode:                     "unix"
 				max_frame_length:         102400
 				socket_file_mode:         508
 				socket_path:              "/run/bind/dnstap.sock"
@@ -1055,6 +1037,7 @@ components: sources: dnstap: {
 		{
 			title: "Dnstap events for a pair of DNS update request and response."
 			configuration: {
+				mode:                       "unix"
 				socket_file_mode:           508
 				socket_path:                "/run/bind/dnstap.sock"
 				socket_receive_buffer_size: 10485760
@@ -1177,7 +1160,7 @@ components: sources: dnstap: {
 		server_uds: {
 			title: "Server Unix Domain Socket (UDS)"
 			body: """
-				The `dnstap` source receives dnstap data through a Unix Domain Socket (aka UDS). The
+				The `dnstap` source can receive dnstap data through a Unix Domain Socket (aka UDS). The
 				path of the UDS must be explicitly specified in the source's configuration.
 
 				Upon startup, the `dnstap` source creates a new server UDS at the specified path.
@@ -1193,6 +1176,7 @@ components: sources: dnstap: {
 				```toml
 				[sources.my_dnstap_source]
 				type = "dnstap"
+				mode = "unix"
 				socket_file_mode: 0o774
 				# Other configs
 				```
@@ -1227,6 +1211,7 @@ components: sources: dnstap: {
 				```toml
 				[sources.my_dnstap_source]
 				type = "dnstap"
+				mode = "unix"
 				socket_receive_buffer_size = 10_485_760
 				socket_send_buffer_size = 10_485_760
 				# Other configs
@@ -1238,15 +1223,5 @@ components: sources: dnstap: {
 				large enough.
 				"""
 		}
-	}
-
-	telemetry: metrics: {
-		events_in_total:                      components.sources.internal_metrics.output.metrics.events_in_total
-		processed_bytes_total:                components.sources.internal_metrics.output.metrics.processed_bytes_total
-		processed_events_total:               components.sources.internal_metrics.output.metrics.processed_events_total
-		parse_errors_total:                   components.sources.internal_metrics.output.metrics.parse_errors_total
-		component_received_bytes_total:       components.sources.internal_metrics.output.metrics.component_received_bytes_total
-		component_received_events_total:      components.sources.internal_metrics.output.metrics.component_received_events_total
-		component_received_event_bytes_total: components.sources.internal_metrics.output.metrics.component_received_event_bytes_total
 	}
 }

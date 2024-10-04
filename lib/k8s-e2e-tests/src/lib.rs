@@ -17,7 +17,7 @@ pub mod metrics;
 pub const BUSYBOX_IMAGE: &str = "busybox:1.28";
 
 pub fn init() {
-    let _ = env_logger::builder().is_test(true).try_init();
+    _ = env_logger::builder().is_test(true).try_init();
 }
 
 pub fn get_namespace() -> String {
@@ -281,7 +281,7 @@ where
                 // We got an EOF error, this is most likely some very long line,
                 // we don't produce lines this bing is our test cases, so we'll
                 // just skip the error - as if it wasn't a JSON string.
-                error!("The JSON line we just got was incomplete, most likely it was was too long, so we're skipping it");
+                error!("The JSON line we just got was incomplete, most likely it was too long, so we're skipping it");
                 continue;
             }
             Err(err) => return Err(err.into()),
@@ -307,7 +307,7 @@ where
     Ok(())
 }
 
-/// Create a pod for our other pods to have an affinity to to ensure they are all deployed on
+/// Create a pod for our other pods to have an affinity to ensure they are all deployed on
 /// the same node.
 pub async fn create_affinity_pod(
     framework: &Framework,

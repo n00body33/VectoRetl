@@ -209,7 +209,7 @@ fn line_to_metrics<'a>(
                 .with_namespace(namespace.map(str::to_string))
                 .with_tags({
                     let mut tags = tags.cloned().unwrap_or_default();
-                    tags.insert("type".to_string(), "user".to_string());
+                    tags.replace("type".to_string(), "user".to_string());
                     Some(tags)
                 })
                 .with_timestamp(Some(now)),
@@ -224,7 +224,7 @@ fn line_to_metrics<'a>(
                 .with_namespace(namespace.map(str::to_string))
                 .with_tags({
                     let mut tags = tags.cloned().unwrap_or_default();
-                    tags.insert("type".to_string(), "system".to_string());
+                    tags.replace("type".to_string(), "system".to_string());
                     Some(tags)
                 })
                 .with_timestamp(Some(now)),
@@ -239,7 +239,7 @@ fn line_to_metrics<'a>(
                 .with_namespace(namespace.map(str::to_string))
                 .with_tags({
                     let mut tags = tags.cloned().unwrap_or_default();
-                    tags.insert("type".to_string(), "children_user".to_string());
+                    tags.replace("type".to_string(), "children_user".to_string());
                     Some(tags)
                 })
                 .with_timestamp(Some(now)),
@@ -254,7 +254,7 @@ fn line_to_metrics<'a>(
                 .with_namespace(namespace.map(str::to_string))
                 .with_tags({
                     let mut tags = tags.cloned().unwrap_or_default();
-                    tags.insert("type".to_string(), "children_system".to_string());
+                    tags.replace("type".to_string(), "children_system".to_string());
                     Some(tags)
                 })
                 .with_timestamp(Some(now)),
@@ -282,7 +282,7 @@ fn line_to_metrics<'a>(
                 .with_namespace(namespace.map(str::to_string))
                 .with_tags({
                     let mut tags = tags.cloned().unwrap_or_default();
-                    tags.insert("state".to_string(), "idle".to_string());
+                    tags.replace("state".to_string(), "idle".to_string());
                     Some(tags)
                 })
                 .with_timestamp(Some(now)),
@@ -299,7 +299,7 @@ fn line_to_metrics<'a>(
                 .with_namespace(namespace.map(str::to_string))
                 .with_tags({
                     let mut tags = tags.cloned().unwrap_or_default();
-                    tags.insert("state".to_string(), "busy".to_string());
+                    tags.replace("state".to_string(), "busy".to_string());
                     Some(tags)
                 })
                 .with_timestamp(Some(now)),
@@ -315,7 +315,7 @@ fn line_to_metrics<'a>(
                 .with_namespace(namespace.map(str::to_string))
                 .with_tags({
                     let mut tags = tags.cloned().unwrap_or_default();
-                    tags.insert("state".to_string(), "total".to_string());
+                    tags.replace("state".to_string(), "total".to_string());
                     Some(tags)
                 })
                 .with_timestamp(Some(now)),
@@ -331,7 +331,7 @@ fn line_to_metrics<'a>(
                 .with_namespace(namespace.map(str::to_string))
                 .with_tags({
                     let mut tags = tags.cloned().unwrap_or_default();
-                    tags.insert("state".to_string(), "writing".to_string());
+                    tags.replace("state".to_string(), "writing".to_string());
                     Some(tags)
                 })
                 .with_timestamp(Some(now)),
@@ -347,7 +347,7 @@ fn line_to_metrics<'a>(
                 .with_namespace(namespace.map(str::to_string))
                 .with_tags({
                     let mut tags = tags.cloned().unwrap_or_default();
-                    tags.insert("state".to_string(), "closing".to_string());
+                    tags.replace("state".to_string(), "closing".to_string());
                     Some(tags)
                 })
                 .with_timestamp(Some(now)),
@@ -363,7 +363,7 @@ fn line_to_metrics<'a>(
                 .with_namespace(namespace.map(str::to_string))
                 .with_tags({
                     let mut tags = tags.cloned().unwrap_or_default();
-                    tags.insert("state".to_string(), "keepalive".to_string());
+                    tags.replace("state".to_string(), "keepalive".to_string());
                     Some(tags)
                 })
                 .with_timestamp(Some(now)),
@@ -415,7 +415,7 @@ fn score_to_metric(
     .with_namespace(namespace.map(str::to_string))
     .with_tags({
         let mut tags = tags.cloned().unwrap_or_default();
-        tags.insert("state".to_string(), state.to_string());
+        tags.replace("state".to_string(), state.to_string());
         Some(tags)
     })
     .with_timestamp(Some(now))
@@ -479,8 +479,8 @@ impl error::Error for ParseError {
 mod test {
     use chrono::{DateTime, Utc};
     use similar_asserts::assert_eq;
-    use vector_common::assert_event_data_eq;
-    use vector_core::metric_tags;
+    use vector_lib::assert_event_data_eq;
+    use vector_lib::metric_tags;
 
     use super::*;
     use crate::event::metric::{Metric, MetricKind, MetricValue};

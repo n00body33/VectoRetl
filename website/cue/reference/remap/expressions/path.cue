@@ -5,6 +5,8 @@ remap: expressions: path: {
 	description: """
 		A _path_ expression is a sequence of period-delimited segments that represent the location of a value
 		within an object.
+		A leading "." means the path points to the event.
+		A leading "%" means the path points to the event _metadata_.
 		"""
 	return: """
 		Returns the value of the path location.
@@ -17,8 +19,12 @@ remap: expressions: path: {
 		definitions: {
 			"\".\"": {
 				description: """
-					The `"."` character represents the root of the event. Therefore, _all_ paths must begin with the `.`
-					character, and `.` alone is a valid path.
+					The `.` character represents the root of the event. All paths must begin with `.` or `%`
+					"""
+			}
+			"\"%\"": {
+				description: """
+					The `%` character represents the root of the event metadata.
 					"""
 			}
 			path_segments: {
@@ -35,18 +41,6 @@ remap: expressions: path: {
 
 							```coffee
 							.array[0]
-							```
-							"""
-					}
-					coalescing: {
-						title:       "Path segment coalescing"
-						description: """
-							Path segments can be coalesced, allowing for the first non-null value to be used. This is
-							particularly useful when working with
-							[externally tagged](\(urls.externally_tagged_representation)) data:
-
-							```coffee
-							.grand_parent.(parent1 | parent2).child
 							```
 							"""
 					}
@@ -98,12 +92,20 @@ remap: expressions: path: {
 
 	examples: [
 		{
-			title: "Root path"
+			title: "Root event path"
 			input: log: message: "Hello, World!"
 			source: #"""
 				.
 				"""#
 			return: input.log
+		},
+		{
+			title: "Root metadata path"
+			input: log: message: "Hello, World!"
+			source: #"""
+				%
+				"""#
+			return: {}
 		},
 		{
 			title: "Top-level path"
@@ -120,14 +122,6 @@ remap: expressions: path: {
 				.parent.child
 				"""#
 			return: input.log.parent.child
-		},
-		{
-			title: "Nested path coalescing"
-			input: log: grand_parent: parent2: child: "Hello, World!"
-			source: #"""
-				.grand_parent.(parent1 | parent2).child
-				"""#
-			return: input.log.grand_parent.parent2.child
 		},
 		{
 			title: "Array element path (first)"

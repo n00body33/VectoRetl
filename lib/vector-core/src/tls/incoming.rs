@@ -1,3 +1,4 @@
+use ipnet::IpNet;
 use std::{
     collections::HashMap,
     future::Future,
@@ -32,7 +33,7 @@ impl TlsSettings {
             Some(_) => {
                 let mut acceptor = SslAcceptor::mozilla_intermediate(SslMethod::tls())
                     .context(CreateAcceptorSnafu)?;
-                self.apply_context(&mut acceptor)?;
+                self.apply_context_base(&mut acceptor, true)?;
                 Ok(acceptor.build())
             }
         }
@@ -48,24 +49,64 @@ impl MaybeTlsSettings {
             Self::Raw(()) => None,
         };
 
-        Ok(MaybeTlsListener { listener, acceptor })
+        Ok(MaybeTlsListener {
+            listener,
+            acceptor,
+            origin_filter: None,
+        })
+    }
+
+    pub async fn bind_with_allowlist(
+        &self,
+        addr: &SocketAddr,
+        allow_origin: Vec<IpNet>,
+    ) -> crate::tls::Result<MaybeTlsListener> {
+        let listener = TcpListener::bind(addr).await.context(TcpBindSnafu)?;
+
+        let acceptor = match self {
+            Self::Tls(tls) => Some(tls.acceptor()?),
+            Self::Raw(()) => None,
+        };
+
+        Ok(MaybeTlsListener {
+            listener,
+            acceptor,
+            origin_filter: Some(allow_origin),
+        })
     }
 }
 
 pub struct MaybeTlsListener {
     listener: TcpListener,
     acceptor: Option<SslAcceptor>,
+    origin_filter: Option<Vec<IpNet>>,
 }
 
 impl MaybeTlsListener {
     pub async fn accept(&mut self) -> crate::tls::Result<MaybeTlsIncomingStream<TcpStream>> {
-        self.listener
+        let listener = self
+            .listener
             .accept()
             .await
             .map(|(stream, peer_addr)| {
                 MaybeTlsIncomingStream::new(stream, peer_addr, self.acceptor.clone())
             })
-            .context(IncomingListenerSnafu)
+            .context(IncomingListenerSnafu)?;
+
+        if let Some(origin_filter) = &self.origin_filter {
+            if origin_filter
+                .iter()
+                .any(|net| net.contains(&listener.peer_addr().ip()))
+            {
+                Ok(listener)
+            } else {
+                Err(TlsError::Connect {
+                    source: std::io::ErrorKind::ConnectionRefused.into(),
+                })
+            }
+        } else {
+            Ok(listener)
+        }
     }
 
     async fn into_accept(
@@ -127,6 +168,12 @@ impl MaybeTlsListener {
     pub fn local_addr(&self) -> Result<SocketAddr, std::io::Error> {
         self.listener.local_addr()
     }
+
+    #[must_use]
+    pub fn with_allowlist(mut self, allowlist: Option<Vec<IpNet>>) -> Self {
+        self.origin_filter = allowlist;
+        self
+    }
 }
 
 impl From<TcpListener> for MaybeTlsListener {
@@ -134,6 +181,7 @@ impl From<TcpListener> for MaybeTlsListener {
         Self {
             listener,
             acceptor: None,
+            origin_filter: None,
         }
     }
 }
@@ -263,7 +311,7 @@ impl MaybeTlsIncomingStream<TcpStream> {
     where
         F: FnOnce(Pin<&mut MaybeTlsStream<TcpStream>>, &mut Context) -> Poll<io::Result<T>>,
     {
-        let mut this = self.get_mut();
+        let this = self.get_mut();
         loop {
             return match &mut this.state {
                 StreamState::Accepted(stream) => poll_fn(Pin::new(stream), cx),
@@ -307,7 +355,7 @@ impl AsyncWrite for MaybeTlsIncomingStream<TcpStream> {
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
-        let mut this = self.get_mut();
+        let this = self.get_mut();
         match &mut this.state {
             StreamState::Accepted(stream) => match Pin::new(stream).poll_shutdown(cx) {
                 Poll::Ready(Ok(())) => {
@@ -349,22 +397,22 @@ impl CertificateMetadata {
     pub fn subject(&self) -> String {
         let mut components = Vec::<String>::with_capacity(6);
         if let Some(cn) = &self.common_name {
-            components.push(format!("CN={}", cn));
+            components.push(format!("CN={cn}"));
         }
         if let Some(ou) = &self.organizational_unit_name {
-            components.push(format!("OU={}", ou));
+            components.push(format!("OU={ou}"));
         }
         if let Some(o) = &self.organization_name {
-            components.push(format!("O={}", o));
+            components.push(format!("O={o}"));
         }
         if let Some(l) = &self.locality_name {
-            components.push(format!("L={}", l));
+            components.push(format!("L={l}"));
         }
         if let Some(st) = &self.state_or_province_name {
-            components.push(format!("ST={}", st));
+            components.push(format!("ST={st}"));
         }
         if let Some(c) = &self.country_name {
-            components.push(format!("C={}", c));
+            components.push(format!("C={c}"));
         }
         components.join(",")
     }
@@ -376,7 +424,7 @@ impl From<X509> for CertificateMetadata {
         for entry in cert.subject_name().entries() {
             let data_string = match entry.data().as_utf8() {
                 Ok(data) => data.to_string(),
-                Err(_) => "".to_string(),
+                Err(_) => String::new(),
             };
             subject_metadata.insert(entry.object().to_string(), data_string);
         }

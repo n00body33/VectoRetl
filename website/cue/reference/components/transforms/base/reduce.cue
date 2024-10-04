@@ -1,6 +1,14 @@
 package metadata
 
 base: components: transforms: reduce: configuration: {
+	end_every_period_ms: {
+		description: """
+			If supplied, every time this interval elapses for a given grouping, the reduced value
+			for that grouping is flushed. Checked every flush_period_ms.
+			"""
+		required: false
+		type: uint: {}
+	}
 	ends_when: {
 		description: """
 			A condition used to distinguish the final event of a transaction.
@@ -36,50 +44,41 @@ base: components: transforms: reduce: configuration: {
 
 			Each group with matching values for the specified keys is reduced independently, allowing
 			you to keep independent event streams separate. When no fields are specified, all events
-			will be combined in a single group.
+			are combined in a single group.
 
 			For example, if `group_by = ["host", "region"]`, then all incoming events that have the same
-			host and region will be grouped together before being reduced.
+			host and region are grouped together before being reduced.
 			"""
 		required: false
 		type: array: {
 			default: []
-			items: type: string: {
-				examples: ["request_id", "user_id", "transaction_id"]
-				syntax: "literal"
-			}
+			items: type: string: examples: ["request_id", "user_id", "transaction_id"]
 		}
+	}
+	max_events: {
+		description: "The maximum number of events to group together."
+		required:    false
+		type: uint: {}
 	}
 	merge_strategies: {
 		description: """
 			A map of field names to custom merge strategies.
 
-			For each field specified, the given strategy will be used for combining events rather than
+			For each field specified, the given strategy is used for combining events rather than
 			the default behavior.
 
 			The default behavior is as follows:
 
-			- The first value of a string field is kept, subsequent values are discarded.
+			- The first value of a string field is kept and subsequent values are discarded.
 			- For timestamp fields the first is kept and a new field `[field-name]_end` is added with
 			  the last received timestamp value.
 			- Numeric values are summed.
+			- For nested paths, the field value is retrieved and then reduced using the default strategies mentioned above (unless explicitly specified otherwise).
 			"""
 		required: false
 		type: object: options: "*": {
-			description: """
-				A map of field names to custom merge strategies.
-
-				For each field specified, the given strategy will be used for combining events rather than
-				the default behavior.
-
-				The default behavior is as follows:
-
-				- The first value of a string field is kept, subsequent values are discarded.
-				- For timestamp fields the first is kept and a new field `[field-name]_end` is added with
-				  the last received timestamp value.
-				- Numeric values are summed.
-				"""
-			required: true
+			description: "An individual merge strategy."
+			required:    true
 			type: string: enum: {
 				array:          "Append each value to an array."
 				concat:         "Concatenate each string value, delimited with a space."

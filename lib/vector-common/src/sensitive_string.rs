@@ -2,11 +2,8 @@ use vector_config::{configurable_component, ConfigurableString};
 
 /// Wrapper for sensitive strings containing credentials
 #[configurable_component(no_deser, no_ser)]
-#[cfg_attr(
-    feature = "serde",
-    derive(::serde::Deserialize, ::serde::Serialize),
-    serde(from = "String", into = "String")
-)]
+#[derive(::serde::Deserialize, ::serde::Serialize)]
+#[serde(from = "String", into = "String")]
 #[configurable(metadata(sensitive))]
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct SensitiveString(String);
@@ -60,9 +57,9 @@ mod tests {
     #[test]
     fn hide_content() {
         let value = SensitiveString("hello world".to_string());
-        let display = format!("{}", value);
+        let display = format!("{value}");
         assert_eq!(display, "**REDACTED**");
-        let debug = format!("{:?}", value);
+        let debug = format!("{value:?}");
         assert_eq!(debug, "\"**REDACTED**\"");
     }
 }

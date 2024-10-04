@@ -13,7 +13,7 @@ solving that problem that can then be applied incrementally to the most expensiv
 
 - Custom registered metric in the `SourceSender` that should be an `InternalEvent`:
   https://github.com/vectordotdev/vector/pull/13611
-- Performance boost from emiiting events once per batch:
+- Performance boost from emitting events once per batch:
   https://github.com/vectordotdev/vector/pull/13739
 
 ## Scope
@@ -161,7 +161,7 @@ impl RegisterInternalEvent for RegisteredEndpointBytesReceived {
     type Handle = EndpointBytesReceivedHandle;
 
     fn register(self) -> Self::Handle {
-        let bytes_total = register_counter!(
+        let bytes_total = counter!(
             "component_received_bytes_total",
             "protocol" => self.protocol,
             "endpoint" => self.endpoint.clone(),
@@ -211,7 +211,7 @@ struct RunningSource {
 
 ## Rationale
 
-- This interface for registered internal event handles is notationally equivalent to the existing
+- This interface for registered internal event handles is notionally equivalent to the existing
   `InternalEvent` interface, using field names and named types for all data.
 
 ## Drawbacks

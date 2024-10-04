@@ -7,11 +7,8 @@ use vector_config::{configurable_component, ConfigurableString};
 
 /// Component identifier.
 #[configurable_component(no_deser, no_ser)]
-#[cfg_attr(
-    feature = "serde",
-    derive(::serde::Deserialize, ::serde::Serialize),
-    serde(from = "String", into = "String")
-)]
+#[derive(::serde::Deserialize, ::serde::Serialize)]
+#[serde(from = "String", into = "String")]
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ComponentKey {
     /// Component ID.
@@ -33,7 +30,7 @@ impl ComponentKey {
     }
 
     pub fn port<D: fmt::Display>(&self, name: D) -> String {
-        format!("{}.{}", self.id, name)
+        format!("{}.{name}", self.id)
     }
 
     #[must_use]

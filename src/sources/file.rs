@@ -2,29 +2,39 @@ use std::{convert::TryInto, future, path::PathBuf, time::Duration};
 
 use bytes::Bytes;
 use chrono::Utc;
-use file_source::{
-    paths_provider::glob::{Glob, MatchOptions},
-    Checkpointer, FileFingerprint, FileServer, FingerprintStrategy, Fingerprinter, Line, ReadFrom,
-};
 use futures::{FutureExt, Stream, StreamExt, TryFutureExt};
 use regex::bytes::Regex;
+use serde_with::serde_as;
 use snafu::{ResultExt, Snafu};
 use tokio::{sync::oneshot, task::spawn_blocking};
 use tracing::{Instrument, Span};
-use vector_common::finalizer::OrderedFinalizer;
-use vector_config::configurable_component;
-use vector_core::config::LogNamespace;
+use vector_lib::codecs::{BytesDeserializer, BytesDeserializerConfig};
+use vector_lib::configurable::configurable_component;
+use vector_lib::file_source::{
+    calculate_ignore_before,
+    paths_provider::glob::{Glob, MatchOptions},
+    Checkpointer, FileFingerprint, FileServer, FingerprintStrategy, Fingerprinter, Line, ReadFrom,
+    ReadFromConfig,
+};
+use vector_lib::finalizer::OrderedFinalizer;
+use vector_lib::lookup::{lookup_v2::OptionalValuePath, owned_value_path, path, OwnedValuePath};
+use vector_lib::{
+    config::{LegacyKey, LogNamespace},
+    EstimatedJsonEncodedSizeOf,
+};
+use vrl::value::Kind;
 
 use super::util::{EncodingConfig, MultilineConfig};
 use crate::{
     config::{
-        log_schema, DataType, Output, SourceAcknowledgementsConfig, SourceConfig, SourceContext,
+        log_schema, DataType, SourceAcknowledgementsConfig, SourceConfig, SourceContext,
+        SourceOutput,
     },
     encoding_transcode::{Decoder, Encoder},
     event::{BatchNotifier, BatchStatus, LogEvent},
     internal_events::{
-        FileBytesReceived, FileEventsReceived, FileOpen, FileSourceInternalEventsEmitter,
-        StreamClosedError,
+        FileBytesReceived, FileEventsReceived, FileInternalMetricsConfig, FileOpen,
+        FileSourceInternalEventsEmitter, StreamClosedError,
     },
     line_agg::{self, LineAgg},
     serde::bool_or_struct,
@@ -34,22 +44,6 @@ use crate::{
 
 #[derive(Debug, Snafu)]
 enum BuildError {
-    #[snafu(display("data_dir option required, but not given here or globally"))]
-    NoDataDir,
-    #[snafu(display(
-        "could not create subdirectory {:?} inside of data_dir {:?}",
-        subdir,
-        data_dir
-    ))]
-    MakeSubdirectoryError {
-        subdir: PathBuf,
-        data_dir: PathBuf,
-        source: std::io::Error,
-    },
-    #[snafu(display("data_dir {:?} does not exist", data_dir))]
-    MissingDataDir { data_dir: PathBuf },
-    #[snafu(display("data_dir {:?} is not writable", data_dir))]
-    DataDirNotWritable { data_dir: PathBuf },
     #[snafu(display(
         "message_start_indicator {:?} is not a valid regex: {}",
         indicator,
@@ -62,33 +56,38 @@ enum BuildError {
 }
 
 /// Configuration for the `file` source.
-#[configurable_component(source("file"))]
+#[serde_as]
+#[configurable_component(source("file", "Collect logs from files."))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct FileConfig {
     /// Array of file patterns to include. [Globbing](https://vector.dev/docs/reference/configuration/sources/file/#globbing) is supported.
+    #[configurable(metadata(docs::examples = "/var/log/**/*.log"))]
     pub include: Vec<PathBuf>,
 
     /// Array of file patterns to exclude. [Globbing](https://vector.dev/docs/reference/configuration/sources/file/#globbing) is supported.
     ///
-    /// Takes precedence over the `include` option. Note that the `exclude` patterns are applied _after_ Vector attempts to glob everything
-    /// in `include`. That is, Vector will still try to list all of the files matched by `include` and then filter them by the `exclude`
-    /// patterns. This can be impactful if `include` contains directories with contents that vector does not have access to.
+    /// Takes precedence over the `include` option. Note: The `exclude` patterns are applied _after_ the attempt to glob everything
+    /// in `include`. This means that all files are first matched by `include` and then filtered by the `exclude`
+    /// patterns. This can be impactful if `include` contains directories with contents that are not accessible.
     #[serde(default)]
+    #[configurable(metadata(docs::examples = "/var/log/binary-file.log"))]
     pub exclude: Vec<PathBuf>,
 
     /// Overrides the name of the log field used to add the file path to each event.
     ///
-    /// The value will be the full path to the file where the event was read message.
+    /// The value is the full path to the file where the event was read message.
     ///
-    /// By default, `file` is used.
+    /// Set to `""` to suppress this key.
     #[serde(default = "default_file_key")]
-    pub file_key: Option<String>,
+    #[configurable(metadata(docs::examples = "path"))]
+    pub file_key: OptionalValuePath,
 
     /// Whether or not to start reading from the beginning of a new file.
-    ///
-    /// DEPRECATED: This is a deprecated option -- replaced by `ignore_checkpoints`/`read_from` -- and should be removed.
-    #[configurable(deprecated)]
+    #[configurable(
+        deprecated = "This option has been deprecated, use `ignore_checkpoints`/`read_from` instead."
+    )]
+    #[configurable(metadata(docs::hidden))]
     #[serde(default)]
     pub start_at_beginning: Option<bool>,
 
@@ -98,52 +97,69 @@ pub struct FileConfig {
     #[serde(default)]
     pub ignore_checkpoints: Option<bool>,
 
+    #[serde(default = "default_read_from")]
     #[configurable(derived)]
-    #[serde(default)]
-    pub read_from: Option<ReadFromConfig>,
+    pub read_from: ReadFromConfig,
 
     /// Ignore files with a data modification date older than the specified number of seconds.
     #[serde(alias = "ignore_older", default)]
+    #[configurable(metadata(docs::type_unit = "seconds"))]
+    #[configurable(metadata(docs::examples = 600))]
+    #[configurable(metadata(docs::human_name = "Ignore Older Files"))]
     pub ignore_older_secs: Option<u64>,
 
-    /// The maximum number of bytes a line can contain before being discarded.
+    /// The maximum size of a line before it is discarded.
     ///
     /// This protects against malformed lines or tailing incorrect files.
     #[serde(default = "default_max_line_bytes")]
+    #[configurable(metadata(docs::type_unit = "bytes"))]
     pub max_line_bytes: usize,
 
     /// Overrides the name of the log field used to add the current hostname to each event.
     ///
-    /// The value will be the current hostname for wherever Vector is running.
-    ///
     /// By default, the [global `log_schema.host_key` option][global_host_key] is used.
     ///
+    /// Set to `""` to suppress this key.
+    ///
     /// [global_host_key]: https://vector.dev/docs/reference/configuration/global-options/#log_schema.host_key
-    #[serde(default)]
-    pub host_key: Option<String>,
+    #[configurable(metadata(docs::examples = "hostname"))]
+    pub host_key: Option<OptionalValuePath>,
 
     /// The directory used to persist file checkpoint positions.
     ///
-    /// By default, the global `data_dir` option is used. Please make sure the user Vector is running as has write permissions to this directory.
+    /// By default, the [global `data_dir` option][global_data_dir] is used.
+    /// Make sure the running user has write permissions to this directory.
+    ///
+    /// If this directory is specified, then Vector will attempt to create it.
+    ///
+    /// [global_data_dir]: https://vector.dev/docs/reference/configuration/global-options/#data_dir
     #[serde(default)]
+    #[configurable(metadata(docs::examples = "/var/local/lib/vector/"))]
+    #[configurable(metadata(docs::human_name = "Data Directory"))]
     pub data_dir: Option<PathBuf>,
 
     /// Enables adding the file offset to each event and sets the name of the log field used.
     ///
-    /// The value will be the byte offset of the start of the line within the file.
+    /// The value is the byte offset of the start of the line within the file.
     ///
     /// Off by default, the offset is only added to the event if this is set.
     #[serde(default)]
-    pub offset_key: Option<String>,
+    #[configurable(metadata(docs::examples = "offset"))]
+    pub offset_key: Option<OptionalValuePath>,
 
-    /// Delay between file discovery calls, in milliseconds.
+    /// The delay between file discovery calls.
     ///
-    /// This controls the interval at which Vector searches for files. Higher value result in greater chances of some short living files being missed between searches, but lower value increases the performance impact of file discovery.
+    /// This controls the interval at which files are searched. A higher value results in greater
+    /// chances of some short-lived files being missed between searches, but a lower value increases
+    /// the performance impact of file discovery.
     #[serde(
         alias = "glob_minimum_cooldown",
         default = "default_glob_minimum_cooldown_ms"
     )]
-    pub glob_minimum_cooldown_ms: u64,
+    #[serde_as(as = "serde_with::DurationMilliSeconds<u64>")]
+    #[configurable(metadata(docs::type_unit = "milliseconds"))]
+    #[configurable(metadata(docs::human_name = "Glob Minimum Cooldown"))]
+    pub glob_minimum_cooldown_ms: Duration,
 
     #[configurable(derived)]
     #[serde(alias = "fingerprinting", default)]
@@ -156,41 +172,51 @@ pub struct FileConfig {
     pub ignore_not_found: bool,
 
     /// String value used to identify the start of a multi-line message.
-    ///
-    /// DEPRECATED: This is a deprecated option -- replaced by `multiline` -- and should be removed.
-    #[configurable(deprecated)]
+    #[configurable(deprecated = "This option has been deprecated, use `multiline` instead.")]
+    #[configurable(metadata(docs::hidden))]
     #[serde(default)]
     pub message_start_indicator: Option<String>,
 
     /// How long to wait for more data when aggregating a multi-line message, in milliseconds.
-    ///
-    /// DEPRECATED: This is a deprecated option -- replaced by `multiline` -- and should be removed.
-    #[configurable(deprecated)]
+    #[configurable(deprecated = "This option has been deprecated, use `multiline` instead.")]
+    #[configurable(metadata(docs::hidden))]
     #[serde(default = "default_multi_line_timeout")]
     pub multi_line_timeout: u64,
 
     /// Multiline aggregation configuration.
     ///
     /// If not specified, multiline aggregation is disabled.
+    #[configurable(derived)]
     #[serde(default)]
     pub multiline: Option<MultilineConfig>,
 
-    /// An approximate limit on the amount of data read from a single file at a given time.
+    /// Max amount of bytes to read from a single file before switching over to the next file.
+    /// **Note:** This does not apply when `oldest_first` is `true`.
+    ///
+    /// This allows distributing the reads more or less evenly across
+    /// the files.
     #[serde(default = "default_max_read_bytes")]
+    #[configurable(metadata(docs::type_unit = "bytes"))]
     pub max_read_bytes: usize,
 
-    /// Instead of balancing read capacity fairly across all watched files, prioritize draining the oldest files before moving on to read data from younger files.
+    /// Instead of balancing read capacity fairly across all watched files, prioritize draining the oldest files before moving on to read data from more recent files.
     #[serde(default)]
     pub oldest_first: bool,
 
-    /// Timeout from reaching `EOF` after which file will be removed from filesystem, unless new data is written in the meantime.
+    /// After reaching EOF, the number of seconds to wait before removing the file, unless new data is written.
     ///
-    /// If not specified, files will not be removed.
+    /// If not specified, files are not removed.
     #[serde(alias = "remove_after", default)]
+    #[configurable(metadata(docs::type_unit = "seconds"))]
+    #[configurable(metadata(docs::examples = 0))]
+    #[configurable(metadata(docs::examples = 5))]
+    #[configurable(metadata(docs::examples = 60))]
+    #[configurable(metadata(docs::human_name = "Wait Time Before Removing File"))]
     pub remove_after_secs: Option<u64>,
 
     /// String sequence used to separate one file line from another.
     #[serde(default = "default_line_delimiter")]
+    #[configurable(metadata(docs::examples = "\r\n"))]
     pub line_delimiter: String,
 
     #[configurable(derived)]
@@ -200,23 +226,43 @@ pub struct FileConfig {
     #[configurable(derived)]
     #[serde(default, deserialize_with = "bool_or_struct")]
     acknowledgements: SourceAcknowledgementsConfig,
+
+    /// The namespace to use for logs. This overrides the global setting.
+    #[configurable(metadata(docs::hidden))]
+    #[serde(default)]
+    log_namespace: Option<bool>,
+
+    #[configurable(derived)]
+    #[serde(default)]
+    internal_metrics: FileInternalMetricsConfig,
+
+    /// How long to keep an open handle to a rotated log file.
+    /// The default value represents "no limit"
+    #[serde_as(as = "serde_with::DurationSeconds<u64>")]
+    #[configurable(metadata(docs::type_unit = "seconds"))]
+    #[serde(default = "default_rotate_wait", rename = "rotate_wait_secs")]
+    pub rotate_wait: Duration,
 }
 
 fn default_max_line_bytes() -> usize {
     bytesize::kib(100u64) as usize
 }
 
-fn default_file_key() -> Option<String> {
-    Some("file".to_string())
+fn default_file_key() -> OptionalValuePath {
+    OptionalValuePath::from(owned_value_path!("file"))
 }
 
-const fn default_glob_minimum_cooldown_ms() -> u64 {
-    1000
+const fn default_read_from() -> ReadFromConfig {
+    ReadFromConfig::Beginning
+}
+
+const fn default_glob_minimum_cooldown_ms() -> Duration {
+    Duration::from_millis(1000)
 }
 
 const fn default_multi_line_timeout() -> u64 {
     1000
-}
+} // deprecated
 
 const fn default_max_read_bytes() -> usize {
     2048
@@ -226,25 +272,36 @@ fn default_line_delimiter() -> String {
     "\n".to_string()
 }
 
+const fn default_rotate_wait() -> Duration {
+    Duration::from_secs(u64::MAX / 2)
+}
+
 /// Configuration for how files should be identified.
 ///
 /// This is important for `checkpointing` when file rotation is used.
 #[configurable_component]
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[serde(tag = "strategy", rename_all = "snake_case")]
+#[configurable(metadata(
+    docs::enum_tag_description = "The strategy used to uniquely identify files.\n\nThis is important for checkpointing when file rotation is used."
+))]
 pub enum FingerprintConfig {
     /// Read lines from the beginning of the file and compute a checksum over them.
     Checksum {
         /// Maximum number of bytes to use, from the lines that are read, for generating the checksum.
         ///
-        /// TODO: Should we properly expose this in the documentation? There could definitely be value in allowing more
-        /// bytes to be used for the checksum generation, but we should commit to exposing it rather than hiding it.
+        // TODO: Should we properly expose this in the documentation? There could definitely be value in allowing more
+        // bytes to be used for the checksum generation, but we should commit to exposing it rather than hiding it.
         #[serde(alias = "fingerprint_bytes")]
+        #[configurable(metadata(docs::hidden))]
+        #[configurable(metadata(docs::type_unit = "bytes"))]
         bytes: Option<usize>,
 
         /// The number of bytes to skip ahead (or ignore) when reading the data used for generating the checksum.
         ///
         /// This can be helpful if all files share a common header that should be skipped.
+        #[serde(default = "default_ignored_header_bytes")]
+        #[configurable(metadata(docs::type_unit = "bytes"))]
         ignored_header_bytes: usize,
 
         /// The number of lines to read for generating the checksum.
@@ -253,10 +310,13 @@ pub enum FingerprintConfig {
         ///
         /// If the file has less than this amount of lines, it won’t be read at all.
         #[serde(default = "default_lines")]
+        #[configurable(metadata(docs::type_unit = "lines"))]
         lines: usize,
     },
 
-    /// Use the [device and inode](https://en.wikipedia.org/wiki/Inode) as the identifier.
+    /// Use the [device and inode][inode] as the identifier.
+    ///
+    /// [inode]: https://en.wikipedia.org/wiki/Inode
     #[serde(rename = "device_and_inode")]
     DevInode,
 }
@@ -271,28 +331,12 @@ impl Default for FingerprintConfig {
     }
 }
 
+const fn default_ignored_header_bytes() -> usize {
+    0
+}
+
 const fn default_lines() -> usize {
     1
-}
-/// File position to use when reading a new file.
-#[configurable_component]
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ReadFromConfig {
-    /// Read from the beginning of the file.
-    Beginning,
-
-    /// Start reading from the current end of the file.
-    End,
-}
-
-impl From<ReadFromConfig> for ReadFrom {
-    fn from(rfc: ReadFromConfig) -> Self {
-        match rfc {
-            ReadFromConfig::Beginning => ReadFrom::Beginning,
-            ReadFromConfig::End => ReadFrom::End,
-        }
-    }
 }
 
 impl From<FingerprintConfig> for FingerprintStrategy {
@@ -335,7 +379,7 @@ impl Default for FileConfig {
             file_key: default_file_key(),
             start_at_beginning: None,
             ignore_checkpoints: None,
-            read_from: None,
+            read_from: default_read_from(),
             ignore_older_secs: None,
             max_line_bytes: default_max_line_bytes(),
             fingerprint: FingerprintConfig::default(),
@@ -343,7 +387,7 @@ impl Default for FileConfig {
             host_key: None,
             offset_key: None,
             data_dir: None,
-            glob_minimum_cooldown_ms: default_glob_minimum_cooldown_ms(), // millis
+            glob_minimum_cooldown_ms: default_glob_minimum_cooldown_ms(),
             message_start_indicator: None,
             multi_line_timeout: default_multi_line_timeout(), // millis
             multiline: None,
@@ -353,6 +397,9 @@ impl Default for FileConfig {
             line_delimiter: default_line_delimiter(),
             encoding: None,
             acknowledgements: Default::default(),
+            log_namespace: None,
+            internal_metrics: Default::default(),
+            rotate_wait: default_rotate_wait(),
         }
     }
 }
@@ -360,6 +407,7 @@ impl Default for FileConfig {
 impl_generate_config_from_default!(FileConfig);
 
 #[async_trait::async_trait]
+#[typetag::serde(name = "file")]
 impl SourceConfig for FileConfig {
     async fn build(&self, cx: SourceContext) -> crate::Result<super::Source> {
         // add the source name as a subdir, so that multiple sources can
@@ -386,17 +434,62 @@ impl SourceConfig for FileConfig {
 
         let acknowledgements = cx.do_acknowledgements(self.acknowledgements);
 
+        let log_namespace = cx.log_namespace(self.log_namespace);
+
         Ok(file_source(
             self,
             data_dir,
             cx.shutdown,
             cx.out,
             acknowledgements,
+            log_namespace,
         ))
     }
 
-    fn outputs(&self, _global_log_namespace: LogNamespace) -> Vec<Output> {
-        vec![Output::default(DataType::Log)]
+    fn outputs(&self, global_log_namespace: LogNamespace) -> Vec<SourceOutput> {
+        let file_key = self.file_key.clone().path.map(LegacyKey::Overwrite);
+        let host_key = self
+            .host_key
+            .clone()
+            .unwrap_or(log_schema().host_key().cloned().into())
+            .path
+            .map(LegacyKey::Overwrite);
+
+        let offset_key = self
+            .offset_key
+            .clone()
+            .and_then(|k| k.path)
+            .map(LegacyKey::Overwrite);
+
+        let schema_definition = BytesDeserializerConfig
+            .schema_definition(global_log_namespace.merge(self.log_namespace))
+            .with_standard_vector_source_metadata()
+            .with_source_metadata(
+                Self::NAME,
+                host_key,
+                &owned_value_path!("host"),
+                Kind::bytes().or_undefined(),
+                Some("host"),
+            )
+            .with_source_metadata(
+                Self::NAME,
+                offset_key,
+                &owned_value_path!("offset"),
+                Kind::integer(),
+                None,
+            )
+            .with_source_metadata(
+                Self::NAME,
+                file_key,
+                &owned_value_path!("path"),
+                Kind::bytes(),
+                None,
+            );
+
+        vec![SourceOutput::new_maybe_logs(
+            DataType::Log,
+            schema_definition,
+        )]
     }
 
     fn can_acknowledge(&self) -> bool {
@@ -410,6 +503,7 @@ pub fn file_source(
     shutdown: ShutdownSignal,
     mut out: SourceSender,
     acknowledgements: bool,
+    log_namespace: LogNamespace,
 ) -> super::Source {
     // the include option must be specified but also must contain at least one entry.
     if config.include.is_empty() {
@@ -417,21 +511,28 @@ pub fn file_source(
         return Box::pin(future::ready(Err(())));
     }
 
-    let ignore_before = config
-        .ignore_older_secs
-        .map(|secs| Utc::now() - chrono::Duration::seconds(secs as i64));
-    let glob_minimum_cooldown = Duration::from_millis(config.glob_minimum_cooldown_ms);
+    let exclude_patterns = config
+        .exclude
+        .iter()
+        .map(|path_buf| path_buf.iter().collect::<std::path::PathBuf>())
+        .collect::<Vec<PathBuf>>();
+    let ignore_before = calculate_ignore_before(config.ignore_older_secs);
+    let glob_minimum_cooldown = config.glob_minimum_cooldown_ms;
     let (ignore_checkpoints, read_from) = reconcile_position_options(
         config.start_at_beginning,
         config.ignore_checkpoints,
-        config.read_from,
+        Some(config.read_from),
     );
+
+    let emitter = FileSourceInternalEventsEmitter {
+        include_file_metric_tag: config.internal_metrics.include_file_tag,
+    };
 
     let paths_provider = Glob::new(
         &config.include,
-        &config.exclude,
+        &exclude_patterns,
         MatchOptions::default(),
-        FileSourceInternalEventsEmitter,
+        emitter.clone(),
     )
     .expect("invalid glob patterns");
 
@@ -462,18 +563,20 @@ pub fn file_source(
         },
         oldest_first: config.oldest_first,
         remove_after: config.remove_after_secs.map(Duration::from_secs),
-        emitter: FileSourceInternalEventsEmitter,
+        emitter,
         handle: tokio::runtime::Handle::current(),
+        rotate_wait: config.rotate_wait,
     };
 
     let event_metadata = EventMetadata {
         host_key: config
             .host_key
             .clone()
-            .unwrap_or_else(|| log_schema().host_key().to_string()),
+            .unwrap_or(log_schema().host_key().cloned().into())
+            .path,
         hostname: crate::get_hostname().ok(),
-        file_key: config.file_key.clone(),
-        offset_key: config.offset_key.clone(),
+        file_key: config.file_key.clone().path,
+        offset_key: config.offset_key.clone().and_then(|k| k.path),
     };
 
     let include = config.include.clone();
@@ -486,7 +589,8 @@ pub fn file_source(
         // The shutdown sent in to the finalizer is the global
         // shutdown handle used to tell it to stop accepting new batch
         // statuses and just wait for the remaining acks to come in.
-        let (finalizer, mut ack_stream) = OrderedFinalizer::<FinalizerEntry>::new(shutdown.clone());
+        let (finalizer, mut ack_stream) = OrderedFinalizer::<FinalizerEntry>::new(None);
+
         // We set up a separate shutdown signal to tie together the
         // finalizer and the checkpoint writer task in the file
         // server, to make it continue to write out updated
@@ -509,6 +613,7 @@ pub fn file_source(
     };
 
     let checkpoints = checkpointer.view();
+    let include_file_metric_tag = config.internal_metrics.include_file_tag;
     Box::pin(async move {
         info!(message = "Starting file server.", include = ?include, exclude = ?exclude);
 
@@ -523,6 +628,7 @@ pub fn file_source(
                 emit!(FileBytesReceived {
                     byte_size: line.text.len(),
                     file: &line.filename,
+                    include_file_metric_tag,
                 });
                 // transcode each line from the file's encoding charset to utf8
                 line.text = match encoding_decoder.as_mut() {
@@ -553,14 +659,14 @@ pub fn file_source(
         // Once file server ends this will run until it has finished processing remaining
         // logs in the queue.
         let span = Span::current();
-        let span2 = span.clone();
         let mut messages = messages.map(move |line| {
-            let _enter = span2.enter();
             let mut event = create_event(
                 line.text,
                 line.start_offset,
                 &line.filename,
                 &event_metadata,
+                log_namespace,
+                include_file_metric_tag,
             );
 
             if let Some(finalizer) = &finalizer {
@@ -585,9 +691,9 @@ pub fn file_source(
                 Ok(()) => {
                     debug!("Finished sending.");
                 }
-                Err(error) => {
+                Err(_) => {
                     let (count, _) = messages.size_hint();
-                    emit!(StreamClosedError { error, count });
+                    emit!(StreamClosedError { count });
                 }
             }
         });
@@ -647,47 +753,86 @@ fn wrap_with_line_agg(
             logic,
         )
         .map(
-            |(filename, text, (file_id, start_offset, end_offset))| Line {
+            |(filename, text, (file_id, start_offset, initial_end), lastline_context)| Line {
                 text,
                 filename,
                 file_id,
                 start_offset,
-                end_offset,
+                end_offset: lastline_context.map_or(initial_end, |(_, _, lastline_end_offset)| {
+                    lastline_end_offset
+                }),
             },
         ),
     )
 }
 
 struct EventMetadata {
-    host_key: String,
+    host_key: Option<OwnedValuePath>,
     hostname: Option<String>,
-    file_key: Option<String>,
-    offset_key: Option<String>,
+    file_key: Option<OwnedValuePath>,
+    offset_key: Option<OwnedValuePath>,
 }
 
-fn create_event(line: Bytes, offset: u64, file: &str, meta: &EventMetadata) -> LogEvent {
+fn create_event(
+    line: Bytes,
+    offset: u64,
+    file: &str,
+    meta: &EventMetadata,
+    log_namespace: LogNamespace,
+    include_file_metric_tag: bool,
+) -> LogEvent {
+    let deserializer = BytesDeserializer;
+    let mut event = deserializer.parse_single(line, log_namespace);
+
+    log_namespace.insert_vector_metadata(
+        &mut event,
+        log_schema().source_type_key(),
+        path!("source_type"),
+        Bytes::from_static(FileConfig::NAME.as_bytes()),
+    );
+    log_namespace.insert_vector_metadata(
+        &mut event,
+        log_schema().timestamp_key(),
+        path!("ingest_timestamp"),
+        Utc::now(),
+    );
+
+    let legacy_host_key = meta.host_key.as_ref().map(LegacyKey::Overwrite);
+    // `meta.host_key` is already `unwrap_or_else`ed so we can just pass it in.
+    if let Some(hostname) = &meta.hostname {
+        log_namespace.insert_source_metadata(
+            FileConfig::NAME,
+            &mut event,
+            legacy_host_key,
+            path!("host"),
+            hostname.clone(),
+        );
+    }
+
+    let legacy_offset_key = meta.offset_key.as_ref().map(LegacyKey::Overwrite);
+    log_namespace.insert_source_metadata(
+        FileConfig::NAME,
+        &mut event,
+        legacy_offset_key,
+        path!("offset"),
+        offset,
+    );
+
+    let legacy_file_key = meta.file_key.as_ref().map(LegacyKey::Overwrite);
+    log_namespace.insert_source_metadata(
+        FileConfig::NAME,
+        &mut event,
+        legacy_file_key,
+        path!("path"),
+        file,
+    );
+
     emit!(FileEventsReceived {
         count: 1,
         file,
-        byte_size: line.len(),
+        byte_size: event.estimated_json_encoded_size_of(),
+        include_file_metric_tag,
     });
-
-    let mut event = LogEvent::from_bytes_legacy(&line);
-
-    // Add source type
-    event.insert(log_schema().source_type_key(), Bytes::from("file"));
-
-    if let Some(offset_key) = &meta.offset_key {
-        event.insert(offset_key.as_str(), offset);
-    }
-
-    if let Some(file_key) = &meta.file_key {
-        event.insert(file_key.as_str(), file);
-    }
-
-    if let Some(hostname) = &meta.hostname {
-        event.insert(meta.host_key.as_str(), hostname.clone());
-    }
 
     event
 }
@@ -705,6 +850,8 @@ mod tests {
     use similar_asserts::assert_eq;
     use tempfile::tempdir;
     use tokio::time::{sleep, timeout, Duration};
+    use vector_lib::schema::Definition;
+    use vrl::value::kind::Collection;
 
     use super::*;
     use crate::{
@@ -714,6 +861,7 @@ mod tests {
         sources::file,
         test_util::components::{assert_source_compliance, FILE_SOURCE_TAGS},
     };
+    use vrl::value;
 
     #[test]
     fn generate_config() {
@@ -728,7 +876,10 @@ mod tests {
                 lines: 1,
             },
             data_dir: Some(dir.path().to_path_buf()),
-            glob_minimum_cooldown_ms: 100, // millis
+            glob_minimum_cooldown_ms: Duration::from_millis(100),
+            internal_metrics: FileInternalMetricsConfig {
+                include_file_tag: true,
+            },
             ..Default::default()
         }
     }
@@ -806,7 +957,7 @@ mod tests {
         "#,
         )
         .unwrap();
-        assert_eq!(config.read_from, Some(ReadFromConfig::Beginning));
+        assert_eq!(config.read_from, ReadFromConfig::Beginning);
 
         let config: FileConfig = toml::from_str(
             r#"
@@ -815,7 +966,7 @@ mod tests {
         "#,
         )
         .unwrap();
-        assert_eq!(config.read_from, Some(ReadFromConfig::End));
+        assert_eq!(config.read_from, ReadFromConfig::End);
     }
 
     #[test]
@@ -839,29 +990,169 @@ mod tests {
     }
 
     #[test]
-    fn file_create_event() {
+    fn output_schema_definition_vector_namespace() {
+        let definitions = FileConfig::default()
+            .outputs(LogNamespace::Vector)
+            .remove(0)
+            .schema_definition(true);
+
+        assert_eq!(
+            definitions,
+            Some(
+                Definition::new_with_default_metadata(Kind::bytes(), [LogNamespace::Vector])
+                    .with_meaning(OwnedTargetPath::event_root(), "message")
+                    .with_metadata_field(
+                        &owned_value_path!("vector", "source_type"),
+                        Kind::bytes(),
+                        None
+                    )
+                    .with_metadata_field(
+                        &owned_value_path!("vector", "ingest_timestamp"),
+                        Kind::timestamp(),
+                        None
+                    )
+                    .with_metadata_field(
+                        &owned_value_path!("file", "host"),
+                        Kind::bytes().or_undefined(),
+                        Some("host")
+                    )
+                    .with_metadata_field(
+                        &owned_value_path!("file", "offset"),
+                        Kind::integer(),
+                        None
+                    )
+                    .with_metadata_field(&owned_value_path!("file", "path"), Kind::bytes(), None)
+            )
+        )
+    }
+
+    #[test]
+    fn output_schema_definition_legacy_namespace() {
+        let definitions = FileConfig::default()
+            .outputs(LogNamespace::Legacy)
+            .remove(0)
+            .schema_definition(true);
+
+        assert_eq!(
+            definitions,
+            Some(
+                Definition::new_with_default_metadata(
+                    Kind::object(Collection::empty()),
+                    [LogNamespace::Legacy]
+                )
+                .with_event_field(
+                    &owned_value_path!("message"),
+                    Kind::bytes(),
+                    Some("message")
+                )
+                .with_event_field(&owned_value_path!("source_type"), Kind::bytes(), None)
+                .with_event_field(&owned_value_path!("timestamp"), Kind::timestamp(), None)
+                .with_event_field(
+                    &owned_value_path!("host"),
+                    Kind::bytes().or_undefined(),
+                    Some("host")
+                )
+                .with_event_field(&owned_value_path!("offset"), Kind::undefined(), None)
+                .with_event_field(&owned_value_path!("file"), Kind::bytes(), None)
+            )
+        )
+    }
+
+    #[test]
+    fn create_event_legacy_namespace() {
         let line = Bytes::from("hello world");
         let file = "some_file.rs";
-
-        let host_key = "host".to_string();
-        let hostname = Some("Some.Machine".to_string());
-        let file_key = Some("file".to_string());
-        let offset_key = Some("offset".to_string());
         let offset: u64 = 0;
 
         let meta = EventMetadata {
-            host_key,
-            hostname,
-            file_key,
-            offset_key,
+            host_key: Some(owned_value_path!("host")),
+            hostname: Some("Some.Machine".to_string()),
+            file_key: Some(owned_value_path!("file")),
+            offset_key: Some(owned_value_path!("offset")),
         };
-        let log = create_event(line, offset, file, &meta);
+        let log = create_event(line, offset, file, &meta, LogNamespace::Legacy, false);
 
         assert_eq!(log["file"], "some_file.rs".into());
         assert_eq!(log["host"], "Some.Machine".into());
         assert_eq!(log["offset"], 0.into());
-        assert_eq!(log[log_schema().message_key()], "hello world".into());
-        assert_eq!(log[log_schema().source_type_key()], "file".into());
+        assert_eq!(*log.get_message().unwrap(), "hello world".into());
+        assert_eq!(*log.get_source_type().unwrap(), "file".into());
+        assert!(log[log_schema().timestamp_key().unwrap().to_string()].is_timestamp());
+    }
+
+    #[test]
+    fn create_event_custom_fields_legacy_namespace() {
+        let line = Bytes::from("hello world");
+        let file = "some_file.rs";
+        let offset: u64 = 0;
+
+        let meta = EventMetadata {
+            host_key: Some(owned_value_path!("hostname")),
+            hostname: Some("Some.Machine".to_string()),
+            file_key: Some(owned_value_path!("file_path")),
+            offset_key: Some(owned_value_path!("off")),
+        };
+        let log = create_event(line, offset, file, &meta, LogNamespace::Legacy, false);
+
+        assert_eq!(log["file_path"], "some_file.rs".into());
+        assert_eq!(log["hostname"], "Some.Machine".into());
+        assert_eq!(log["off"], 0.into());
+        assert_eq!(*log.get_message().unwrap(), "hello world".into());
+        assert_eq!(*log.get_source_type().unwrap(), "file".into());
+        assert!(log[log_schema().timestamp_key().unwrap().to_string()].is_timestamp());
+    }
+
+    #[test]
+    fn create_event_vector_namespace() {
+        let line = Bytes::from("hello world");
+        let file = "some_file.rs";
+        let offset: u64 = 0;
+
+        let meta = EventMetadata {
+            host_key: Some(owned_value_path!("ignored")),
+            hostname: Some("Some.Machine".to_string()),
+            file_key: Some(owned_value_path!("ignored")),
+            offset_key: Some(owned_value_path!("ignored")),
+        };
+        let log = create_event(line, offset, file, &meta, LogNamespace::Vector, false);
+
+        assert_eq!(log.value(), &value!("hello world"));
+
+        assert_eq!(
+            log.metadata()
+                .value()
+                .get(path!("vector", "source_type"))
+                .unwrap(),
+            &value!("file")
+        );
+        assert!(log
+            .metadata()
+            .value()
+            .get(path!("vector", "ingest_timestamp"))
+            .unwrap()
+            .is_timestamp());
+
+        assert_eq!(
+            log.metadata()
+                .value()
+                .get(path!(FileConfig::NAME, "host"))
+                .unwrap(),
+            &value!("Some.Machine")
+        );
+        assert_eq!(
+            log.metadata()
+                .value()
+                .get(path!(FileConfig::NAME, "offset"))
+                .unwrap(),
+            &value!(0)
+        );
+        assert_eq!(
+            log.metadata()
+                .value()
+                .get(path!(FileConfig::NAME, "path"))
+                .unwrap(),
+            &value!("some_file.rs")
+        );
     }
 
     #[tokio::test]
@@ -877,7 +1168,7 @@ mod tests {
         let path1 = dir.path().join("file1");
         let path2 = dir.path().join("file2");
 
-        let received = run_file_source(&config, false, NoAcks, async {
+        let received = run_file_source(&config, false, NoAcks, LogNamespace::Legacy, async {
             let mut file1 = File::create(&path1).unwrap();
             let mut file2 = File::create(&path2).unwrap();
 
@@ -896,7 +1187,8 @@ mod tests {
         let mut goodbye_i = 0;
 
         for event in received {
-            let line = event.as_log()[log_schema().message_key()].to_string_lossy();
+            let line =
+                event.as_log()[log_schema().message_key().unwrap().to_string()].to_string_lossy();
             if line.starts_with("hello") {
                 assert_eq!(line, format!("hello {}", hello_i));
                 assert_eq!(
@@ -930,7 +1222,7 @@ mod tests {
 
         let path = dir.path().join("file");
 
-        let received = run_file_source(&config, false, NoAcks, async {
+        let received = run_file_source(&config, false, NoAcks, LogNamespace::Legacy, async {
             let mut file = File::create(&path).unwrap();
 
             sleep_500_millis().await; // The files must be observed at their original lengths before writing to them
@@ -957,7 +1249,7 @@ mod tests {
             ..test_default_file_config(&dir)
         };
         let path = dir.path().join("file");
-        let received = run_file_source(&config, false, NoAcks, async {
+        let received = run_file_source(&config, false, NoAcks, LogNamespace::Legacy, async {
             let mut file = File::create(&path).unwrap();
 
             sleep_500_millis().await; // The files must be observed at its original length before writing to it
@@ -990,7 +1282,8 @@ mod tests {
                 path.to_str().unwrap()
             );
 
-            let line = event.as_log()[log_schema().message_key()].to_string_lossy();
+            let line =
+                event.as_log()[log_schema().message_key().unwrap().to_string()].to_string_lossy();
 
             if pre_trunc {
                 assert_eq!(line, format!("pretrunc {}", i));
@@ -1018,7 +1311,7 @@ mod tests {
 
         let path = dir.path().join("file");
         let archive_path = dir.path().join("file");
-        let received = run_file_source(&config, false, NoAcks, async {
+        let received = run_file_source(&config, false, NoAcks, LogNamespace::Legacy, async {
             let mut file = File::create(&path).unwrap();
 
             sleep_500_millis().await; // The files must be observed at its original length before writing to it
@@ -1051,7 +1344,8 @@ mod tests {
                 path.to_str().unwrap()
             );
 
-            let line = event.as_log()[log_schema().message_key()].to_string_lossy();
+            let line =
+                event.as_log()[log_schema().message_key().unwrap().to_string()].to_string_lossy();
 
             if pre_rot {
                 assert_eq!(line, format!("prerot {}", i));
@@ -1082,7 +1376,7 @@ mod tests {
         let path2 = dir.path().join("b.txt");
         let path3 = dir.path().join("a.log");
         let path4 = dir.path().join("a.ignore.txt");
-        let received = run_file_source(&config, false, NoAcks, async {
+        let received = run_file_source(&config, false, NoAcks, LogNamespace::Legacy, async {
             let mut file1 = File::create(&path1).unwrap();
             let mut file2 = File::create(&path2).unwrap();
             let mut file3 = File::create(&path3).unwrap();
@@ -1104,7 +1398,8 @@ mod tests {
         let mut is = [0; 3];
 
         for event in received {
-            let line = event.as_log()[log_schema().message_key()].to_string_lossy();
+            let line =
+                event.as_log()[log_schema().message_key().unwrap().to_string()].to_string_lossy();
             let mut split = line.split(' ');
             let file = split.next().unwrap().parse::<usize>().unwrap();
             assert_ne!(file, 4);
@@ -1118,12 +1413,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn file_exclude_paths() {
+        let n = 5;
+
+        let dir = tempdir().unwrap();
+        let config = file::FileConfig {
+            include: vec![dir.path().join("a//b/*.log.*")],
+            exclude: vec![dir.path().join("a//b/test.log.*")],
+            ..test_default_file_config(&dir)
+        };
+
+        let path1 = dir.path().join("a//b/a.log.1");
+        let path2 = dir.path().join("a//b/test.log.1");
+        let received = run_file_source(&config, false, NoAcks, LogNamespace::Legacy, async {
+            std::fs::create_dir_all(dir.path().join("a/b")).unwrap();
+            let mut file1 = File::create(&path1).unwrap();
+            let mut file2 = File::create(&path2).unwrap();
+
+            sleep_500_millis().await; // The files must be observed at their original lengths before writing to them
+
+            for i in 0..n {
+                writeln!(&mut file1, "1 {}", i).unwrap();
+                writeln!(&mut file2, "2 {}", i).unwrap();
+            }
+
+            sleep_500_millis().await;
+        })
+        .await;
+
+        let mut is = [0; 1];
+
+        for event in received {
+            let line =
+                event.as_log()[log_schema().message_key().unwrap().to_string()].to_string_lossy();
+            let mut split = line.split(' ');
+            let file = split.next().unwrap().parse::<usize>().unwrap();
+            assert_ne!(file, 4);
+            let i = split.next().unwrap().parse::<usize>().unwrap();
+
+            assert_eq!(is[file - 1], i);
+            is[file - 1] += 1;
+        }
+
+        assert_eq!(is, [n as usize; 1]);
+    }
+
+    #[tokio::test]
     async fn file_key_acknowledged() {
         file_key(Acks).await
     }
 
     #[tokio::test]
-    async fn file_key_nonacknowledged() {
+    async fn file_key_no_acknowledge() {
         file_key(NoAcks).await
     }
 
@@ -1137,7 +1478,7 @@ mod tests {
             };
 
             let path = dir.path().join("file");
-            let received = run_file_source(&config, true, acks, async {
+            let received = run_file_source(&config, true, acks, LogNamespace::Legacy, async {
                 let mut file = File::create(&path).unwrap();
 
                 sleep_500_millis().await;
@@ -1160,12 +1501,12 @@ mod tests {
             let dir = tempdir().unwrap();
             let config = file::FileConfig {
                 include: vec![dir.path().join("*")],
-                file_key: Some("source".to_string()),
+                file_key: OptionalValuePath::from(owned_value_path!("source")),
                 ..test_default_file_config(&dir)
             };
 
             let path = dir.path().join("file");
-            let received = run_file_source(&config, true, acks, async {
+            let received = run_file_source(&config, true, acks, LogNamespace::Legacy, async {
                 let mut file = File::create(&path).unwrap();
 
                 sleep_500_millis().await;
@@ -1188,12 +1529,11 @@ mod tests {
             let dir = tempdir().unwrap();
             let config = file::FileConfig {
                 include: vec![dir.path().join("*")],
-                file_key: None,
                 ..test_default_file_config(&dir)
             };
 
             let path = dir.path().join("file");
-            let received = run_file_source(&config, true, acks, async {
+            let received = run_file_source(&config, true, acks, LogNamespace::Legacy, async {
                 let mut file = File::create(&path).unwrap();
 
                 sleep_500_millis().await;
@@ -1208,10 +1548,15 @@ mod tests {
             assert_eq!(
                 received[0].as_log().keys().unwrap().collect::<HashSet<_>>(),
                 vec![
-                    log_schema().host_key().to_string(),
-                    log_schema().message_key().to_string(),
-                    log_schema().timestamp_key().to_string(),
-                    log_schema().source_type_key().to_string()
+                    default_file_key()
+                        .path
+                        .expect("file key to exist")
+                        .to_string()
+                        .into(),
+                    log_schema().host_key().unwrap().to_string().into(),
+                    log_schema().message_key().unwrap().to_string().into(),
+                    log_schema().timestamp_key().unwrap().to_string().into(),
+                    log_schema().source_type_key().unwrap().to_string().into()
                 ]
                 .into_iter()
                 .collect::<HashSet<_>>()
@@ -1227,7 +1572,7 @@ mod tests {
 
     #[cfg(target_os = "linux")] // see #7988
     #[tokio::test]
-    async fn file_start_position_server_restart_nonacknowledged() {
+    async fn file_start_position_server_restart_no_acknowledge() {
         file_start_position_server_restart(NoAcks).await
     }
 
@@ -1246,7 +1591,7 @@ mod tests {
 
         // First time server runs it picks up existing lines.
         {
-            let received = run_file_source(&config, true, acking, async {
+            let received = run_file_source(&config, true, acking, LogNamespace::Legacy, async {
                 sleep_500_millis().await;
                 writeln!(&mut file, "first line").unwrap();
                 sleep_500_millis().await;
@@ -1258,7 +1603,7 @@ mod tests {
         }
         // Restart server, read file from checkpoint.
         {
-            let received = run_file_source(&config, true, acking, async {
+            let received = run_file_source(&config, true, acking, LogNamespace::Legacy, async {
                 sleep_500_millis().await;
                 writeln!(&mut file, "second line").unwrap();
                 sleep_500_millis().await;
@@ -1273,10 +1618,10 @@ mod tests {
             let config = file::FileConfig {
                 include: vec![dir.path().join("*")],
                 ignore_checkpoints: Some(true),
-                read_from: Some(ReadFromConfig::Beginning),
+                read_from: ReadFromConfig::Beginning,
                 ..test_default_file_config(&dir)
             };
-            let received = run_file_source(&config, false, acking, async {
+            let received = run_file_source(&config, false, acking, LogNamespace::Legacy, async {
                 sleep_500_millis().await;
                 writeln!(&mut file, "third line").unwrap();
                 sleep_500_millis().await;
@@ -1305,14 +1650,76 @@ mod tests {
         sleep_500_millis().await;
 
         // First time server runs it picks up existing lines.
-        let received = run_file_source(&config, false, Unfinalized, sleep_500_millis()).await;
+        let received = run_file_source(
+            &config,
+            false,
+            Unfinalized,
+            LogNamespace::Legacy,
+            sleep_500_millis(),
+        )
+        .await;
         let lines = extract_messages_string(received);
         assert_eq!(lines, vec!["the line"]);
 
         // Restart server, it re-reads file since the events were not acknowledged before shutdown
-        let received = run_file_source(&config, false, Unfinalized, sleep_500_millis()).await;
+        let received = run_file_source(
+            &config,
+            false,
+            Unfinalized,
+            LogNamespace::Legacy,
+            sleep_500_millis(),
+        )
+        .await;
         let lines = extract_messages_string(received);
         assert_eq!(lines, vec!["the line"]);
+    }
+
+    #[tokio::test]
+    async fn file_duplicate_processing_after_restart() {
+        let dir = tempdir().unwrap();
+        let config = file::FileConfig {
+            include: vec![dir.path().join("*")],
+            ..test_default_file_config(&dir)
+        };
+
+        let path = dir.path().join("file");
+        let mut file = File::create(&path).unwrap();
+
+        let line_count = 4000;
+        for i in 0..line_count {
+            writeln!(&mut file, "Here's a line for you: {}", i).unwrap();
+        }
+        sleep_500_millis().await;
+
+        // First time server runs it should pick up a bunch of lines
+        let received = run_file_source(
+            &config,
+            true,
+            Acks,
+            LogNamespace::Legacy,
+            // shutdown signal is sent after this duration
+            sleep_500_millis(),
+        )
+        .await;
+        let lines = extract_messages_string(received);
+
+        // ...but not all the lines; if the first run processed the entire file, we may not hit the
+        // bug we're testing for, which happens if the finalizer stream exits on shutdown with pending acks
+        assert!(lines.len() < line_count);
+
+        // Restart the server, and it should read the rest without duplicating any
+        let received = run_file_source(
+            &config,
+            true,
+            Acks,
+            LogNamespace::Legacy,
+            sleep(Duration::from_secs(5)),
+        )
+        .await;
+        let lines2 = extract_messages_string(received);
+
+        // Between both runs, we should have the expected number of lines
+        assert_eq!(lines.len() + lines2.len(), line_count);
     }
 
     #[tokio::test]
@@ -1321,7 +1728,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn file_start_position_server_restart_with_file_rotation_nonacknowledged() {
+    async fn file_start_position_server_restart_with_file_rotation_no_acknowledge() {
         file_start_position_server_restart_with_file_rotation(NoAcks).await
     }
 
@@ -1336,7 +1743,7 @@ mod tests {
         let path_for_old_file = dir.path().join("file.old");
         // Run server first time, collect some lines.
         {
-            let received = run_file_source(&config, true, acking, async {
+            let received = run_file_source(&config, true, acking, LogNamespace::Legacy, async {
                 let mut file = File::create(&path).unwrap();
                 sleep_500_millis().await;
                 writeln!(&mut file, "first line").unwrap();
@@ -1352,7 +1759,7 @@ mod tests {
         // Restart the server and make sure it does not re-read the old file
         // even though it has a new name.
         {
-            let received = run_file_source(&config, false, acking, async {
+            let received = run_file_source(&config, false, acking, LogNamespace::Legacy, async {
                 let mut file = File::create(&path).unwrap();
                 sleep_500_millis().await;
                 writeln!(&mut file, "second line").unwrap();
@@ -1380,7 +1787,7 @@ mod tests {
             ..test_default_file_config(&dir)
         };
 
-        let received = run_file_source(&config, false, NoAcks, async {
+        let received = run_file_source(&config, false, NoAcks, LogNamespace::Legacy, async {
             let before_path = dir.path().join("before");
             let mut before_file = File::create(&before_path).unwrap();
             let after_path = dir.path().join("after");
@@ -1429,12 +1836,16 @@ mod tests {
         let before_lines = received
             .iter()
             .filter(|event| event.as_log()["file"].to_string_lossy().ends_with("before"))
-            .map(|event| event.as_log()[log_schema().message_key()].to_string_lossy())
+            .map(|event| {
+                event.as_log()[log_schema().message_key().unwrap().to_string()].to_string_lossy()
+            })
             .collect::<Vec<_>>();
         let after_lines = received
             .iter()
             .filter(|event| event.as_log()["file"].to_string_lossy().ends_with("after"))
-            .map(|event| event.as_log()[log_schema().message_key()].to_string_lossy())
+            .map(|event| {
+                event.as_log()[log_schema().message_key().unwrap().to_string()].to_string_lossy()
+            })
             .collect::<Vec<_>>();
         assert_eq!(before_lines, vec!["second line"]);
         assert_eq!(after_lines, vec!["_first line", "_second line"]);
@@ -1450,7 +1861,7 @@ mod tests {
         };
 
         let path = dir.path().join("file");
-        let received = run_file_source(&config, false, NoAcks, async {
+        let received = run_file_source(&config, false, NoAcks, LogNamespace::Legacy, async {
             let mut file = File::create(&path).unwrap();
 
             sleep_500_millis().await; // The files must be observed at their original lengths before writing to them
@@ -1492,7 +1903,7 @@ mod tests {
         };
 
         let path = dir.path().join("file");
-        let received = run_file_source(&config, false, NoAcks, async {
+        let received = run_file_source(&config, false, NoAcks, LogNamespace::Legacy, async {
             let mut file = File::create(&path).unwrap();
 
             sleep_500_millis().await; // The files must be observed at their original lengths before writing to them
@@ -1545,13 +1956,13 @@ mod tests {
                 start_pattern: "INFO".to_owned(),
                 condition_pattern: "INFO".to_owned(),
                 mode: line_agg::Mode::HaltBefore,
-                timeout_ms: 25, // less than 50 in sleep()
+                timeout_ms: Duration::from_millis(25), // less than 50 in sleep()
             }),
             ..test_default_file_config(&dir)
         };
 
         let path = dir.path().join("file");
-        let received = run_file_source(&config, false, NoAcks, async {
+        let received = run_file_source(&config, false, NoAcks, LogNamespace::Legacy, async {
             let mut file = File::create(&path).unwrap();
 
             sleep_500_millis().await; // The files must be observed at their original lengths before writing to them
@@ -1600,11 +2011,12 @@ mod tests {
         let dir = tempdir().unwrap();
         let config = file::FileConfig {
             include: vec![dir.path().join("*")],
+            offset_key: Some(OptionalValuePath::from(owned_value_path!("offset"))),
             multiline: Some(MultilineConfig {
                 start_pattern: "INFO".to_owned(),
                 condition_pattern: "INFO".to_owned(),
                 mode: line_agg::Mode::HaltBefore,
-                timeout_ms: 25, // less than 50 in sleep()
+                timeout_ms: Duration::from_millis(25), // less than 50 in sleep()
             }),
             ..test_default_file_config(&dir)
         };
@@ -1616,15 +2028,30 @@ mod tests {
         writeln!(&mut file, "part of hello").unwrap();
 
         // Read and aggregate existing lines
-        let received = run_file_source(&config, false, Acks, sleep_500_millis()).await;
+        let received = run_file_source(
+            &config,
+            false,
+            Acks,
+            LogNamespace::Legacy,
+            sleep_500_millis(),
+        )
+        .await;
+
+        assert_eq!(received[0].as_log()["offset"], 0.into());
+
         let lines = extract_messages_string(received);
         assert_eq!(lines, vec!["INFO hello\npart of hello"]);
 
         // After restart, we should not see any part of the previously aggregated lines
-        let received_after_restart = run_file_source(&config, false, Acks, async {
-            writeln!(&mut file, "INFO goodbye").unwrap();
-        })
-        .await;
+        let received_after_restart =
+            run_file_source(&config, false, Acks, LogNamespace::Legacy, async {
+                writeln!(&mut file, "INFO goodbye").unwrap();
+            })
+            .await;
+        assert_eq!(
+            received_after_restart[0].as_log()["offset"],
+            (lines[0].len() + 1).into()
+        );
         let lines = extract_messages_string(received_after_restart);
         assert_eq!(lines, vec!["INFO goodbye"]);
     }
@@ -1657,7 +2084,14 @@ mod tests {
 
         sleep_500_millis().await;
 
-        let received = run_file_source(&config, false, NoAcks, sleep_500_millis()).await;
+        let received = run_file_source(
+            &config,
+            false,
+            NoAcks,
+            LogNamespace::Legacy,
+            sleep_500_millis(),
+        )
+        .await;
 
         let received = extract_messages_value(received);
 
@@ -1702,7 +2136,14 @@ mod tests {
 
         sleep_500_millis().await;
 
-        let received = run_file_source(&config, false, NoAcks, sleep_500_millis()).await;
+        let received = run_file_source(
+            &config,
+            false,
+            NoAcks,
+            LogNamespace::Legacy,
+            sleep_500_millis(),
+        )
+        .await;
 
         let received = extract_messages_value(received);
 
@@ -1737,7 +2178,7 @@ mod tests {
 
         sleep_500_millis().await;
 
-        let received = run_file_source(&config, false, NoAcks, async {
+        let received = run_file_source(&config, false, NoAcks, LogNamespace::Legacy, async {
             sleep_500_millis().await;
 
             write!(&mut file, "i am not a full line").unwrap();
@@ -1777,7 +2218,14 @@ mod tests {
             ..test_default_file_config(&dir)
         };
 
-        let received = run_file_source(&config, false, NoAcks, sleep_500_millis()).await;
+        let received = run_file_source(
+            &config,
+            false,
+            NoAcks,
+            LogNamespace::Legacy,
+            sleep_500_millis(),
+        )
+        .await;
 
         let received = extract_messages_value(received);
 
@@ -1802,7 +2250,14 @@ mod tests {
             ..test_default_file_config(&dir)
         };
 
-        let received = run_file_source(&config, false, NoAcks, sleep_500_millis()).await;
+        let received = run_file_source(
+            &config,
+            false,
+            NoAcks,
+            LogNamespace::Legacy,
+            sleep_500_millis(),
+        )
+        .await;
 
         let received = extract_messages_value(received);
 
@@ -1828,7 +2283,7 @@ mod tests {
         };
 
         let path = dir.path().join("file");
-        let received = run_file_source(&config, false, NoAcks, async {
+        let received = run_file_source(&config, false, NoAcks, LogNamespace::Legacy, async {
             let mut file = File::create(&path).unwrap();
 
             sleep_500_millis().await; // The files must be observed at their original lengths before writing to them
@@ -1868,7 +2323,7 @@ mod tests {
         };
 
         let path = dir.path().join("file");
-        let received = run_file_source(&config, false, Acks, async {
+        let received = run_file_source(&config, false, Acks, LogNamespace::Legacy, async {
             let mut file = File::create(&path).unwrap();
 
             sleep_500_millis().await; // The files must be observed at their original lengths before writing to them
@@ -1876,7 +2331,7 @@ mod tests {
             for i in 0..n {
                 writeln!(&mut file, "{}", i).unwrap();
             }
-            std::mem::drop(file);
+            drop(file);
 
             for _ in 0..10 {
                 // Wait for remove grace period to end.
@@ -1903,12 +2358,14 @@ mod tests {
         Unfinalized, // Acknowledgement handling but no finalization
         Acks,        // Full acknowledgements and proper finalization
     }
+    use vector_lib::lookup::OwnedTargetPath;
     use AckingMode::*;
 
     async fn run_file_source(
         config: &FileConfig,
         wait_shutdown: bool,
         acking_mode: AckingMode,
+        log_namespace: LogNamespace,
         inner: impl Future<Output = ()>,
     ) -> Vec<Event> {
         assert_source_compliance(&FILE_SOURCE_TAGS, async move {
@@ -1924,7 +2381,14 @@ mod tests {
             let data_dir = config.data_dir.clone().unwrap();
             let acks = !matches!(acking_mode, NoAcks);
 
-            tokio::spawn(file::file_source(config, data_dir, shutdown, tx, acks));
+            tokio::spawn(file::file_source(
+                config,
+                data_dir,
+                shutdown,
+                tx,
+                acks,
+                log_namespace,
+            ));
 
             inner.await;
 
@@ -1954,11 +2418,7 @@ mod tests {
         received
             .into_iter()
             .map(Event::into_log)
-            .map(|log| {
-                log[log_schema().message_key()]
-                    .to_string_lossy()
-                    .into_owned()
-            })
+            .map(|log| log.get_message().unwrap().to_string_lossy().into_owned())
             .collect()
     }
 
@@ -1966,7 +2426,7 @@ mod tests {
         received
             .into_iter()
             .map(Event::into_log)
-            .map(|log| log[log_schema().message_key()].clone())
+            .map(|log| log.get_message().unwrap().clone())
             .collect()
     }
 }

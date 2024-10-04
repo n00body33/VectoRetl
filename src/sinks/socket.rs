@@ -1,19 +1,19 @@
-use codecs::{
+use vector_lib::codecs::{
     encoding::{Framer, FramingConfig},
     TextSerializerConfig,
 };
-use vector_config::configurable_component;
+use vector_lib::configurable::configurable_component;
 
 #[cfg(unix)]
 use crate::sinks::util::unix::UnixSinkConfig;
 use crate::{
     codecs::{Encoder, EncodingConfig, EncodingConfigWithFraming, SinkType},
-    config::{AcknowledgementsConfig, DataType, GenerateConfig, Input, SinkConfig, SinkContext},
+    config::{AcknowledgementsConfig, GenerateConfig, Input, SinkConfig, SinkContext},
     sinks::util::{tcp::TcpSinkConfig, udp::UdpSinkConfig},
 };
 
 /// Configuration for the `socket` sink.
-#[configurable_component(sink("socket"))]
+#[configurable_component(sink("socket", "Deliver logs to a remote socket endpoint."))]
 #[derive(Clone, Debug)]
 pub struct SocketSinkConfig {
     #[serde(flatten)]
@@ -23,7 +23,7 @@ pub struct SocketSinkConfig {
     #[serde(
         default,
         deserialize_with = "crate::serde::bool_or_struct",
-        skip_serializing_if = "crate::serde::skip_serializing_if_default"
+        skip_serializing_if = "crate::serde::is_default"
     )]
     pub acknowledgements: AcknowledgementsConfig,
 }
@@ -32,16 +32,17 @@ pub struct SocketSinkConfig {
 #[configurable_component]
 #[derive(Clone, Debug)]
 #[serde(tag = "mode", rename_all = "snake_case")]
+#[configurable(metadata(docs::enum_tag_description = "The type of socket to use."))]
 pub enum Mode {
-    /// TCP.
-    Tcp(#[configurable(transparent)] TcpMode),
+    /// Send over TCP.
+    Tcp(TcpMode),
 
-    /// UDP.
-    Udp(#[configurable(transparent)] UdpMode),
+    /// Send over UDP.
+    Udp(UdpMode),
 
-    /// Unix Domain Socket.
+    /// Send over a Unix domain socket (UDS).
     #[cfg(unix)]
-    Unix(#[configurable(transparent)] UnixMode),
+    Unix(UnixMode),
 }
 
 /// TCP configuration.
@@ -104,7 +105,7 @@ impl SocketSinkConfig {
         Self::new(
             Mode::Tcp(TcpMode {
                 config: TcpSinkConfig::from_address(address),
-                encoding: (None::<FramingConfig>, TextSerializerConfig::new()).into(),
+                encoding: (None::<FramingConfig>, TextSerializerConfig::default()).into(),
             }),
             acknowledgements,
         )
@@ -112,6 +113,7 @@ impl SocketSinkConfig {
 }
 
 #[async_trait::async_trait]
+#[typetag::serde(name = "socket")]
 impl SinkConfig for SocketSinkConfig {
     async fn build(
         &self,
@@ -147,7 +149,7 @@ impl SinkConfig for SocketSinkConfig {
             #[cfg(unix)]
             Mode::Unix(UnixMode { encoding, .. }) => encoding.config().1.input_type(),
         };
-        Input::new(encoder_input_type & DataType::Log)
+        Input::new(encoder_input_type)
     }
 
     fn acknowledgements(&self) -> &AcknowledgementsConfig {
@@ -157,12 +159,13 @@ impl SinkConfig for SocketSinkConfig {
 
 #[cfg(test)]
 mod test {
+    #[cfg(unix)]
+    use std::path::PathBuf;
     use std::{
         future::ready,
         net::{SocketAddr, UdpSocket},
     };
 
-    use codecs::JsonSerializerConfig;
     use futures::stream::StreamExt;
     use futures_util::stream;
     use serde_json::Value;
@@ -172,8 +175,13 @@ mod test {
     };
     use tokio_stream::wrappers::TcpListenerStream;
     use tokio_util::codec::{FramedRead, LinesCodec};
+    use vector_lib::codecs::JsonSerializerConfig;
+    #[cfg(unix)]
+    use vector_lib::codecs::NativeJsonSerializerConfig;
 
     use super::*;
+    #[cfg(unix)]
+    use crate::test_util::random_metrics_with_stream;
     use crate::{
         config::SinkContext,
         event::{Event, LogEvent},
@@ -194,12 +202,12 @@ mod test {
         let config = SocketSinkConfig {
             mode: Mode::Udp(UdpMode {
                 config: UdpSinkConfig::from_address(addr.to_string()),
-                encoding: JsonSerializerConfig::new().into(),
+                encoding: JsonSerializerConfig::default().into(),
             }),
             acknowledgements: Default::default(),
         };
 
-        let context = SinkContext::new_test();
+        let context = SinkContext::default();
         assert_sink_compliance(&SINK_TAGS, async move {
             let (sink, _healthcheck) = config.build(context).await.unwrap();
 
@@ -244,7 +252,7 @@ mod test {
         let config = SocketSinkConfig {
             mode: Mode::Tcp(TcpMode {
                 config: TcpSinkConfig::from_address(addr.to_string()),
-                encoding: (None::<FramingConfig>, JsonSerializerConfig::new()).into(),
+                encoding: (None::<FramingConfig>, JsonSerializerConfig::default()).into(),
             }),
             acknowledgements: Default::default(),
         };
@@ -254,7 +262,7 @@ mod test {
         let (lines, events) = random_lines_with_stream(10, 100, None);
 
         assert_sink_compliance(&SINK_TAGS, async move {
-            let context = SinkContext::new_test();
+            let context = SinkContext::default();
             let (sink, _healthcheck) = config.build(context).await.unwrap();
 
             sink.run(events).await
@@ -271,6 +279,46 @@ mod test {
             let json = serde_json::from_str::<Value>(&received).expect("Invalid JSON");
             let received = json.get("message").unwrap().as_str().unwrap();
             assert_eq!(source, received);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn metrics_socket() {
+        trace_init();
+
+        let out_path = temp_uds_path("unix_socket_test");
+        let mut receiver = CountReceiver::receive_lines_unix(out_path.clone());
+
+        let config = SocketSinkConfig {
+            mode: Mode::Unix(UnixMode {
+                config: UnixSinkConfig::new(out_path),
+                encoding: (None::<FramingConfig>, NativeJsonSerializerConfig).into(),
+            }),
+            acknowledgements: Default::default(),
+        };
+
+        let (expected, events) = random_metrics_with_stream(10, None, None);
+
+        assert_sink_compliance(&SINK_TAGS, async move {
+            let context = SinkContext::default();
+            let (sink, _healthcheck) = config.build(context).await.unwrap();
+
+            sink.run(events).await
+        })
+        .await
+        .expect("Running sink failed");
+
+        // Wait for output to connect
+        receiver.connected().await;
+
+        let output = receiver.await;
+        assert_eq!(expected.len(), output.len());
+        for (source, received) in expected.iter().zip(output) {
+            let json = serde_json::from_str::<Value>(&received).expect("Invalid JSON");
+            let received = json.get("metric").unwrap();
+            let received_name = received.get("name").unwrap().as_str().unwrap();
+            assert_eq!(source.as_metric().name(), received_name);
         }
     }
 
@@ -327,11 +375,11 @@ mod test {
                     }),
                     None,
                 ),
-                encoding: (None::<FramingConfig>, TextSerializerConfig::new()).into(),
+                encoding: (None::<FramingConfig>, TextSerializerConfig::default()).into(),
             }),
             acknowledgements: Default::default(),
         };
-        let context = SinkContext::new_test();
+        let context = SinkContext::default();
         let (sink, _healthcheck) = config.build(context).await.unwrap();
         let (mut sender, receiver) = mpsc::channel::<Option<EventArray>>(0);
         let jh1 = tokio::spawn(async move {
@@ -446,12 +494,12 @@ mod test {
         let config = SocketSinkConfig {
             mode: Mode::Tcp(TcpMode {
                 config: TcpSinkConfig::from_address(addr.to_string()),
-                encoding: (None::<FramingConfig>, TextSerializerConfig::new()).into(),
+                encoding: (None::<FramingConfig>, TextSerializerConfig::default()).into(),
             }),
             acknowledgements: Default::default(),
         };
 
-        let context = SinkContext::new_test();
+        let context = SinkContext::default();
         let (sink, _healthcheck) = config.build(context).await.unwrap();
 
         let (_, events) = random_lines_with_stream(1000, 10000, None);
@@ -493,5 +541,10 @@ mod test {
         .is_ok());
 
         sink_handle.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    fn temp_uds_path(name: &str) -> PathBuf {
+        tempfile::tempdir().unwrap().into_path().join(name)
     }
 }

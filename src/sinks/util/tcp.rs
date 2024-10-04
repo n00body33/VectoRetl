@@ -17,8 +17,9 @@ use tokio::{
     time::sleep,
 };
 use tokio_util::codec::Encoder;
-use vector_config::configurable_component;
-use vector_core::ByteSizeOf;
+use vector_lib::configurable::configurable_component;
+use vector_lib::json_size::JsonSize;
+use vector_lib::{ByteSizeOf, EstimatedJsonEncodedSizeOf};
 
 use crate::{
     codecs::Transformer,
@@ -48,8 +49,6 @@ enum TcpError {
     DnsError { source: dns::DnsError },
     #[snafu(display("No addresses returned."))]
     NoAddresses,
-    #[snafu(display("Send error: {}", source))]
-    SendError { source: tokio::io::Error },
 }
 
 /// A TCP sink.
@@ -58,7 +57,11 @@ enum TcpError {
 pub struct TcpSinkConfig {
     /// The address to connect to.
     ///
+    /// Both IP address and hostname are accepted formats.
+    ///
     /// The address _must_ include a port.
+    #[configurable(metadata(docs::examples = "92.12.333.224:5000"))]
+    #[configurable(metadata(docs::examples = "https://somehost:5000"))]
     address: String,
 
     #[configurable(derived)]
@@ -67,9 +70,11 @@ pub struct TcpSinkConfig {
     #[configurable(derived)]
     tls: Option<TlsEnableableConfig>,
 
-    /// The size, in bytes, of the socket's send buffer.
+    /// The size of the socket's send buffer.
     ///
     /// If set, the value of the setting is passed via the `SO_SNDBUF` option.
+    #[configurable(metadata(docs::type_unit = "bytes"))]
+    #[configurable(metadata(docs::examples = 65536))]
     send_buffer_bytes: Option<usize>,
 }
 
@@ -100,7 +105,11 @@ impl TcpSinkConfig {
     pub fn build(
         &self,
         transformer: Transformer,
-        encoder: impl Encoder<Event, Error = codecs::encoding::Error> + Clone + Send + Sync + 'static,
+        encoder: impl Encoder<Event, Error = vector_lib::codecs::encoding::Error>
+            + Clone
+            + Send
+            + Sync
+            + 'static,
     ) -> crate::Result<(VectorSink, Healthcheck)> {
         let uri = self.address.parse::<http::Uri>()?;
         let host = uri.host().ok_or(SinkBuildError::MissingHost)?.to_string();
@@ -209,7 +218,7 @@ impl TcpConnector {
 
 struct TcpSink<E>
 where
-    E: Encoder<Event, Error = codecs::encoding::Error> + Clone + Send + Sync,
+    E: Encoder<Event, Error = vector_lib::codecs::encoding::Error> + Clone + Send + Sync,
 {
     connector: TcpConnector,
     transformer: Transformer,
@@ -218,7 +227,7 @@ where
 
 impl<E> TcpSink<E>
 where
-    E: Encoder<Event, Error = codecs::encoding::Error> + Clone + Send + Sync + 'static,
+    E: Encoder<Event, Error = vector_lib::codecs::encoding::Error> + Clone + Send + Sync + 'static,
 {
     const fn new(connector: TcpConnector, transformer: Transformer, encoder: E) -> Self {
         Self {
@@ -261,7 +270,12 @@ where
 #[async_trait]
 impl<E> StreamSink<Event> for TcpSink<E>
 where
-    E: Encoder<Event, Error = codecs::encoding::Error> + Clone + Send + Sync + Sync + 'static,
+    E: Encoder<Event, Error = vector_lib::codecs::encoding::Error>
+        + Clone
+        + Send
+        + Sync
+        + Sync
+        + 'static,
 {
     async fn run(self: Box<Self>, input: BoxStream<'_, Event>) -> Result<(), ()> {
         // We need [Peekable](https://docs.rs/futures/0.3.6/futures/stream/struct.Peekable.html) for initiating
@@ -269,6 +283,7 @@ where
         let mut encoder = self.encoder.clone();
         let mut input = input.map(|mut event| {
             let byte_size = event.size_of();
+            let json_byte_size = event.estimated_json_encoded_size_of();
             let finalizers = event.metadata_mut().take_finalizers();
             self.transformer.transform(&mut event);
             let mut bytes = BytesMut::new();
@@ -280,9 +295,10 @@ where
                     item,
                     finalizers,
                     byte_size,
+                    json_byte_size,
                 }
             } else {
-                EncodedEvent::new(Bytes::new(), 0)
+                EncodedEvent::new(Bytes::new(), 0, JsonSize::zero())
             }
         });
 
@@ -300,7 +316,7 @@ where
             // TODO we can consider retrying once in the Error case. This sink is a "best effort"
             // delivery due to the nature of the underlying protocol.
             // For now, if an error occurs we cannot assume that the events succeeded in delivery
-            // so we will emit `Error` / `EventsDropped` internal events regarless of if the server
+            // so we will emit `Error` / `EventsDropped` internal events regardless of if the server
             // responded with Ok(0).
             if let Err(error) = result {
                 if error.kind() == ErrorKind::Other && error.to_string() == "ShutdownCheck::Close" {

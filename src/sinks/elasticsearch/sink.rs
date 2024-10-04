@@ -1,44 +1,28 @@
-use std::{fmt, num::NonZeroUsize};
+use std::fmt;
 
-use async_trait::async_trait;
-use futures::{future, stream::BoxStream, StreamExt};
-use tower::Service;
-use vector_core::{
-    stream::{BatcherSettings, DriverResponse},
-    ByteSizeOf,
-};
+use vector_lib::lookup::lookup_v2::ConfigValuePath;
+use vrl::path::PathPrefix;
 
 use crate::{
-    codecs::Transformer,
-    event::{Event, LogEvent, Value},
-    internal_events::SinkRequestBuildError,
     sinks::{
         elasticsearch::{
             encoder::ProcessedEvent, request_builder::ElasticsearchRequestBuilder,
             service::ElasticsearchRequest, BulkAction, ElasticsearchCommonMode,
         },
-        util::{SinkBuilderExt, StreamSink},
+        prelude::*,
     },
     transforms::metric_to_log::MetricToLog,
 };
 
-use super::{ElasticsearchCommon, ElasticsearchConfig};
+use super::{
+    encoder::{DocumentMetadata, DocumentVersion, DocumentVersionType},
+    ElasticsearchCommon, ElasticsearchConfig, VersionType,
+};
 
 #[derive(Clone, Eq, Hash, PartialEq)]
 pub struct PartitionKey {
     pub index: String,
     pub bulk_action: BulkAction,
-}
-
-pub struct BatchedEvents {
-    pub key: PartitionKey,
-    pub events: Vec<ProcessedEvent>,
-}
-
-impl ByteSizeOf for BatchedEvents {
-    fn allocated_bytes(&self) -> usize {
-        self.events.size_of()
-    }
 }
 
 pub struct ElasticsearchSink<S> {
@@ -48,7 +32,7 @@ pub struct ElasticsearchSink<S> {
     pub service: S,
     pub metric_to_log: MetricToLog,
     pub mode: ElasticsearchCommonMode,
-    pub id_key_field: Option<String>,
+    pub id_key_field: Option<ConfigValuePath>,
 }
 
 impl<S> ElasticsearchSink<S> {
@@ -79,13 +63,11 @@ where
     S::Error: fmt::Debug + Into<crate::Error> + Send,
 {
     pub async fn run_inner(self: Box<Self>, input: BoxStream<'_, Event>) -> Result<(), ()> {
-        let request_builder_concurrency_limit = NonZeroUsize::new(50);
-
         let mode = self.mode;
-        let id_key_field = self.id_key_field;
+        let id_key_field = self.id_key_field.as_ref();
         let transformer = self.transformer.clone();
 
-        let sink = input
+        input
             .scan(self.metric_to_log, |metric_to_log, event| {
                 future::ready(Some(match event {
                     Event::Metric(metric) => metric_to_log.transform_one(metric),
@@ -100,10 +82,13 @@ where
             })
             .filter_map(|x| async move { x })
             .filter_map(move |log| {
-                future::ready(process_log(log, &mode, &id_key_field, &transformer))
+                future::ready(process_log(log, &mode, id_key_field, &transformer))
             })
-            .batched(self.batch_settings.into_byte_size_config())
-            .request_builder(request_builder_concurrency_limit, self.request_builder)
+            .batched(self.batch_settings.as_byte_size_config())
+            .request_builder(
+                default_request_builder_concurrency_limit(),
+                self.request_builder,
+            )
             .filter_map(|request| async move {
                 match request {
                     Err(error) => {
@@ -113,9 +98,9 @@ where
                     Ok(req) => Some(req),
                 }
             })
-            .into_driver(self.service);
-
-        sink.run().await
+            .into_driver(self.service)
+            .run()
+            .await
     }
 }
 
@@ -124,7 +109,7 @@ where
 pub(super) fn process_log(
     mut log: LogEvent,
     mode: &ElasticsearchCommonMode,
-    id_key_field: &Option<String>,
+    id_key_field: Option<&ConfigValuePath>,
     transformer: &Transformer,
 ) -> Option<ProcessedEvent> {
     let index = mode.index(&log)?;
@@ -134,13 +119,35 @@ pub(super) fn process_log(
         cfg.sync_fields(&mut log);
         cfg.remap_timestamp(&mut log);
     };
-    let id = if let Some(Value::Bytes(key)) = id_key_field
-        .as_ref()
-        .and_then(|key| log.remove(key.as_str()))
+    let id = if let Some(Value::Bytes(key)) =
+        id_key_field.and_then(|key| log.remove((PathPrefix::Event, key)))
     {
         Some(String::from_utf8_lossy(&key).into_owned())
     } else {
         None
+    };
+    let document_metadata = match (id.clone(), mode.version_type(), mode.version(&log)) {
+        (None, _, _) => DocumentMetadata::WithoutId,
+        (Some(id), None, None) | (Some(id), None, Some(_)) | (Some(id), Some(_), None) => {
+            DocumentMetadata::Id(id)
+        }
+        (Some(id), Some(version_type), Some(version)) => match version_type {
+            VersionType::Internal => DocumentMetadata::Id(id),
+            VersionType::External => DocumentMetadata::IdAndVersion(
+                id,
+                DocumentVersion {
+                    kind: DocumentVersionType::External,
+                    value: version,
+                },
+            ),
+            VersionType::ExternalGte => DocumentMetadata::IdAndVersion(
+                id,
+                DocumentVersion {
+                    kind: DocumentVersionType::ExternalGte,
+                    value: version,
+                },
+            ),
+        },
     };
     let log = {
         let mut event = Event::from(log);
@@ -151,7 +158,7 @@ pub(super) fn process_log(
         index,
         bulk_action,
         log,
-        id,
+        document_metadata,
     })
 }
 

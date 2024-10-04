@@ -1,22 +1,17 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    iter,
-};
+use std::{collections::BTreeSet, iter};
 
-use chrono::{DateTime, NaiveDateTime, Utc};
+use chrono::{DateTime, Utc};
 use quickcheck::{empty_shrinker, Arbitrary, Gen};
+use vrl::value::{ObjectMap, Value};
 
-use crate::{
-    event::{
-        metric::{
-            Bucket, MetricData, MetricName, MetricSeries, MetricSketch, MetricTags, MetricTime,
-            Quantile, Sample,
-        },
-        Event, EventMetadata, LogEvent, Metric, MetricKind, MetricValue, StatisticKind, TraceEvent,
-        Value,
+use super::super::{
+    metric::{
+        Bucket, MetricData, MetricName, MetricSeries, MetricSketch, MetricTags, MetricTime,
+        Quantile, Sample,
     },
-    metrics::AgentDDSketch,
+    Event, EventMetadata, LogEvent, Metric, MetricKind, MetricValue, StatisticKind, TraceEvent,
 };
+use crate::metrics::AgentDDSketch;
 
 const MAX_F64_SIZE: f64 = 1_000_000.0;
 const MAX_MAP_SIZE: usize = 4;
@@ -55,7 +50,7 @@ fn datetime(g: &mut Gen) -> DateTime<Utc> {
     // are. We just sort of arbitrarily restrict things.
     let secs = i64::arbitrary(g) % 32_000;
     let nanosecs = u32::arbitrary(g) % 32_000;
-    DateTime::<Utc>::from_utc(NaiveDateTime::from_timestamp(secs, nanosecs), Utc)
+    DateTime::from_timestamp(secs, nanosecs).expect("invalid timestamp")
 }
 
 impl Arbitrary for Event {
@@ -82,7 +77,7 @@ impl Arbitrary for Event {
 impl Arbitrary for LogEvent {
     fn arbitrary(g: &mut Gen) -> Self {
         let mut gen = Gen::new(MAX_MAP_SIZE);
-        let map: BTreeMap<String, Value> = BTreeMap::arbitrary(&mut gen);
+        let map: ObjectMap = ObjectMap::arbitrary(&mut gen);
         let metadata: EventMetadata = EventMetadata::arbitrary(g);
         LogEvent::from_map(map, metadata)
     }
@@ -354,7 +349,7 @@ impl Arbitrary for MetricValue {
             //
             // We can't extract the values used to build it, which is by design, so all we could do
             // is mess with the internal buckets, which isn't even exposed (and absolutely shouldn't
-            // be) and doing that is gauranteed to mess with the sketch in non-obvious ways that
+            // be) and doing that is guaranteed to mess with the sketch in non-obvious ways that
             // would not occur if we were actually seeding it with real samples.
             MetricValue::Sketch { sketch } => Box::new(iter::once(MetricValue::Sketch {
                 sketch: sketch.clone(),
@@ -477,7 +472,7 @@ impl Arbitrary for MetricSeries {
             for _ in 0..(usize::arbitrary(g) % MAX_MAP_SIZE) {
                 let key = String::from(Name::arbitrary(g));
                 let value = String::from(Name::arbitrary(g));
-                map.insert(key, value);
+                map.replace(key, value);
             }
             if map.is_empty() {
                 None

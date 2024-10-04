@@ -13,7 +13,7 @@ use crate::{
         map_event_batch_stream,
     },
 };
-use vector_core::event::{BatchNotifier, BatchStatus};
+use vector_lib::event::{BatchNotifier, BatchStatus};
 
 #[tokio::test]
 async fn to_real_traces_endpoint() {
@@ -23,7 +23,7 @@ async fn to_real_traces_endpoint() {
             compression = "none"
         "#};
         let api_key = std::env::var("TEST_DATADOG_API_KEY")
-            .expect("couldn't find the Datatog api key in environment variables");
+            .expect("couldn't find the Datadog api key in environment variables");
         assert!(!api_key.is_empty(), "TEST_DATADOG_API_KEY required");
         let config = config.replace("atoken", &api_key);
         let (config, cx) = load_sink::<DatadogTracesConfig>(config.as_str()).unwrap();

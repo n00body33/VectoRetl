@@ -30,7 +30,7 @@ lookup = { package = "vector-lookup", path = "../vector-lookup" }
 metrics.workspace = true
 metrics-tracing-context.workspace = true
 metrics-util.workspace = true
-mlua = { version = "0.9.9", default-features = false, features = ["lua54", "send", "vendored"], optional = true }
+mlua = { version = "0.10.1", default-features = false, features = ["lua54", "send", "vendored"], optional = true }
 no-proxy = { version  = "0.3.4", default-features = false, features = ["serialize"] }
 once_cell = { version = "1.19", default-features = false }
 ordered-float = { version = "4.3.0", default-features = false }

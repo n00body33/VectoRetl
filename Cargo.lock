@@ -2183,7 +2183,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3538270d33cc669650c4b093848450d380def10c331d38c768e34cac80576e6e"
 dependencies = [
  "termcolor",
- "unicode-width",
+ "unicode-width 0.1.13",
 ]
 
 [[package]]
@@ -2286,7 +2286,7 @@ dependencies = [
  "encode_unicode 0.3.6",
  "lazy_static",
  "libc",
- "unicode-width",
+ "unicode-width 0.1.13",
  "windows-sys 0.45.0",
 ]
 
@@ -4641,16 +4641,16 @@ dependencies = [
 
 [[package]]
 name = "indicatif"
-version = "0.17.8"
+version = "0.17.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "763a5a8f45087d6bcea4222e7b72c291a054edf80e4ef6efd2a4979878c7bea3"
+checksum = "cbf675b85ed934d3c67b5c5469701eec7db22689d0a2139d856e0925fa28b281"
 dependencies = [
  "console",
- "instant",
  "number_prefix",
  "portable-atomic",
  "unicode-segmentation",
- "unicode-width",
+ "unicode-width 0.2.0",
+ "web-time",
 ]
 
 [[package]]
@@ -6454,7 +6454,7 @@ version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2ad9b889f1b12e0b9ee24db044b5129150d5eada288edc800f789928dc8c0e3"
 dependencies = [
- "unicode-width",
+ "unicode-width 0.1.13",
 ]
 
 [[package]]
@@ -6968,7 +6968,7 @@ dependencies = [
  "is-terminal",
  "lazy_static",
  "term",
- "unicode-width",
+ "unicode-width 0.1.13",
 ]
 
 [[package]]
@@ -7551,7 +7551,7 @@ dependencies = [
  "strum_macros 0.26.4",
  "unicode-segmentation",
  "unicode-truncate",
- "unicode-width",
+ "unicode-width 0.1.13",
 ]
 
 [[package]]
@@ -8263,7 +8263,7 @@ dependencies = [
  "memchr",
  "nix 0.28.0",
  "unicode-segmentation",
- "unicode-width",
+ "unicode-width 0.1.13",
  "utf8parse",
  "windows-sys 0.52.0",
 ]
@@ -10199,7 +10199,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5a5fbabedabe362c618c714dbefda9927b5afc8e2a8102f47f081089a9019226"
 dependencies = [
  "itertools 0.12.1",
- "unicode-width",
+ "unicode-width 0.1.13",
 ]
 
 [[package]]
@@ -10207,6 +10207,12 @@ name = "unicode-width"
 version = "0.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0336d538f7abc86d282a4189614dfaa90810dfc2c6f6427eaf88e16311dd225d"
+
+[[package]]
+name = "unicode-width"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1fc81956842c57dac11422a97c3b8195a1ff727f06e85c84ed2e8aa277c9a0fd"
 
 [[package]]
 name = "unicode-xid"
@@ -11212,6 +11218,16 @@ name = "web-sys"
 version = "0.3.65"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5db499c5f66323272151db0e666cd34f78617522fb0c1604d31a27c50c206a85"
+dependencies = [
+ "js-sys",
+ "wasm-bindgen",
+]
+
+[[package]]
+name = "web-time"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
